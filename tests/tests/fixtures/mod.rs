@@ -19,6 +19,7 @@
 #![allow(unused_imports)]
 
 pub mod db;
+pub mod querygen;
 pub mod tables;
 pub mod utils;
 
@@ -61,6 +62,11 @@ pub fn conn(database: Db) -> PgConnection {
             .execute(&mut conn)
             .await
             .expect("could not adjust log_error_verbosity");
+
+        sqlx::query("SET log_min_duration_statement TO 1000;")
+            .execute(&mut conn)
+            .await
+            .expect("could not set long-running-statement logging");
 
         conn
     })

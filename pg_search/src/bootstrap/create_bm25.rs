@@ -15,118 +15,50 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+use crate::api::FieldName;
+use crate::api::{HashMap, HashSet};
 use crate::index::merge_policy::LayeredMergePolicy;
 use crate::index::mvcc::MvccSatisfies;
 use crate::index::reader::index::SearchIndexReader;
 use crate::postgres::index::IndexKind;
 use crate::postgres::insert::merge_index_with_policy;
-use crate::postgres::options::SearchIndexCreateOptions;
+use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::storage::block::{
     LinkedList, MVCCEntry, SegmentMetaEntry, SEGMENT_METAS_START,
 };
-use crate::postgres::storage::merge::MergeLock;
+use crate::postgres::storage::metadata::MetaPage;
 use crate::postgres::storage::LinkedItemList;
 use crate::postgres::utils::item_pointer_to_u64;
 use crate::query::SearchQueryInput;
-use crate::schema::SearchFieldConfig;
-use crate::schema::SearchFieldName;
-use anyhow::bail;
 use anyhow::Result;
 use pgrx::prelude::*;
 use pgrx::JsonB;
 use pgrx::PgRelation;
-use rustc_hash::FxHashMap;
 use serde_json::Value;
-use std::collections::HashSet;
-
-#[allow(clippy::too_many_arguments)]
-#[pg_extern]
-fn format_create_bm25(
-    index_name: &str,
-    table_name: &str,
-    key_field: &str,
-    schema_name: default!(&str, "''"),
-    text_fields: default!(JsonB, "'{}'::jsonb"),
-    numeric_fields: default!(JsonB, "'{}'::jsonb"),
-    boolean_fields: default!(JsonB, "'{}'::jsonb"),
-    json_fields: default!(JsonB, "'{}'::jsonb"),
-    range_fields: default!(JsonB, "'{}'::jsonb"),
-    datetime_fields: default!(JsonB, "'{}'::jsonb"),
-    predicates: default!(&str, "''"),
-) -> Result<String> {
-    let mut column_names = vec![key_field.to_string()];
-    for fields in [
-        &text_fields,
-        &numeric_fields,
-        &boolean_fields,
-        &json_fields,
-        &range_fields,
-        &datetime_fields,
-    ] {
-        if let Value::Object(ref map) = fields.0 {
-            for key in map.keys() {
-                if key != key_field {
-                    column_names.push(spi::quote_identifier(key.clone()));
-                }
-            }
-        } else {
-            bail!("Expected a JSON object, received: {}", fields.0);
-        }
-    }
-
-    let column_names_csv = column_names
-        .clone()
-        .into_iter()
-        .filter(|name| name != key_field)
-        .collect::<Vec<String>>()
-        .join(", ");
-
-    let predicate_where = if !predicates.is_empty() {
-        format!("WHERE {}", predicates)
-    } else {
-        "".to_string()
-    };
-
-    let schema_prefix = if schema_name.is_empty() {
-        "".to_string()
-    } else {
-        format!("{}.", spi::quote_identifier(schema_name))
-    };
-
-    Ok(format!(
-        "CREATE INDEX {} ON {}{} USING bm25 ({}, {}) WITH (key_field={}, text_fields={}, numeric_fields={}, boolean_fields={}, json_fields={}, range_fields={}, datetime_fields={}) {};",
-        spi::quote_identifier(index_name),
-        schema_prefix,
-        spi::quote_identifier(table_name),
-        spi::quote_identifier(key_field),
-        column_names_csv,
-        spi::quote_literal(key_field),
-        spi::quote_literal(&serde_json::to_string(&text_fields)?),
-        spi::quote_literal(&serde_json::to_string(&numeric_fields)?),
-        spi::quote_literal(&serde_json::to_string(&boolean_fields)?),
-        spi::quote_literal(&serde_json::to_string(&json_fields)?),
-        spi::quote_literal(&serde_json::to_string(&range_fields)?),
-        spi::quote_literal(&serde_json::to_string(&datetime_fields)?),
-        predicate_where))
-}
 
 #[pg_extern]
 pub unsafe fn index_fields(index: PgRelation) -> anyhow::Result<JsonB> {
-    let options = SearchIndexCreateOptions::from_relation(&index);
-    let fields = options.get_all_fields(&index).collect::<Vec<_>>();
-    let name_and_config: FxHashMap<SearchFieldName, SearchFieldConfig> = fields
-        .into_iter()
-        .map(|(field_name, field_config, _)| (field_name, field_config))
-        .collect();
+    let index = PgSearchRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _);
+    let schema = index.schema()?;
+
+    let mut name_and_config = HashMap::default();
+    for (_, field_entry) in schema.fields() {
+        let field_name = field_entry.name();
+        let field_config = index
+            .options()
+            .field_config_or_default(&FieldName::from(field_name));
+        name_and_config.insert(field_name, field_config);
+    }
 
     Ok(JsonB(serde_json::to_value(name_and_config)?))
 }
 
 #[pg_extern]
 pub unsafe fn layer_sizes(index: PgRelation) -> Vec<AnyNumeric> {
-    let options = SearchIndexCreateOptions::from_relation(&index);
-    options
-        .layer_sizes(crate::postgres::insert::DEFAULT_LAYER_SIZES)
+    let index = PgSearchRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _);
+    index
+        .options()
+        .layer_sizes()
         .into_iter()
         .map(|layer_size| layer_size.into())
         .collect()
@@ -141,27 +73,27 @@ unsafe fn merge_info(
         name!(index_name, String),
         name!(pid, i32),
         name!(xmin, pg_sys::TransactionId),
-        name!(xmax, pg_sys::TransactionId),
         name!(segno, String),
     ),
 > {
+    let index = PgSearchRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _);
     let index_kind = IndexKind::for_index(index).unwrap();
 
     let mut result = Vec::new();
     for index in index_kind.partitions() {
-        let merge_lock = MergeLock::acquire(index.oid());
-        let merge_entries = merge_lock.in_progress_merge_entries();
+        let metadata = MetaPage::open(&index);
+        let merge_lock = metadata.acquire_merge_lock();
+        let merge_entries = merge_lock.merge_list().list();
         result.extend(merge_entries.into_iter().flat_map(move |merge_entry| {
             let index_name = index.name().to_owned();
             merge_entry
-                .segment_ids(index.oid())
+                .segment_ids(&index)
                 .into_iter()
                 .map(move |segment_id| {
                     (
                         index_name.clone(),
                         merge_entry.pid,
                         merge_entry.xmin,
-                        merge_entry.xmax,
                         segment_id.short_uuid_string(),
                     )
                 })
@@ -180,12 +112,13 @@ fn is_merging(index: PgRelation) -> bool {
 unsafe fn vacuum_info(
     index: PgRelation,
 ) -> TableIterator<'static, (name!(index_name, String), name!(segno, String))> {
+    let index = PgSearchRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _);
     let index_kind = IndexKind::for_index(index).unwrap();
 
     let mut result = Vec::new();
     for index in index_kind.partitions() {
-        let mut merge_lock = MergeLock::acquire(index.oid());
-        let vacuum_list = merge_lock.list_vacuuming_segments();
+        let metadata = MetaPage::open(&index);
+        let vacuum_list = metadata.vacuum_list().read_list();
         result.extend(
             vacuum_list
                 .iter()
@@ -207,7 +140,6 @@ fn index_info(
             name!(index_name, String),
             name!(visible, bool),
             name!(recyclable, bool),
-            name!(xmin, pg_sys::TransactionId),
             name!(xmax, pg_sys::TransactionId),
             name!(segno, String),
             name!(byte_size, Option<AnyNumeric>),
@@ -231,26 +163,24 @@ fn index_info(
     // Because we accept a PgRelation above, we have confidence that Postgres has already
     // validated the existence of the relation. We are safe calling the function below as
     // long we do not pass pg_sys::NoLock without any other locking mechanism of our own.
-    let index = unsafe { PgRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _) };
+    let index = PgSearchRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _);
     let index_kind = IndexKind::for_index(index)?;
 
     let mut results = Vec::new();
     for index in index_kind.partitions() {
         // open the specified index
         let mut segment_components =
-            LinkedItemList::<SegmentMetaEntry>::open(index.oid(), SEGMENT_METAS_START);
+            LinkedItemList::<SegmentMetaEntry>::open(&index, SEGMENT_METAS_START);
         let all_entries = unsafe { segment_components.list() };
 
-        let snapshot = unsafe { pg_sys::GetActiveSnapshot() };
         for entry in all_entries {
-            if !show_invisible && unsafe { !entry.visible(snapshot) } {
+            if !show_invisible && unsafe { !entry.visible() } {
                 continue;
             }
             results.push((
                 index.name().to_owned(),
-                unsafe { entry.visible(snapshot) },
+                unsafe { entry.visible() },
                 unsafe { entry.recyclable(segment_components.bman_mut()) },
-                entry.xmin,
                 entry.xmax,
                 entry.segment_id.short_uuid_string(),
                 Some(entry.byte_size().into()),
@@ -280,20 +210,15 @@ fn index_info(
 /// you luck in determining which is which.
 #[pg_extern]
 fn find_ctid(index: PgRelation, ctid: pg_sys::ItemPointerData) -> Result<Option<Vec<String>>> {
-    let index = unsafe { PgRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _) };
-
-    let search_index = SearchIndexReader::open(&index, MvccSatisfies::Snapshot)?;
+    let index = PgSearchRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _);
     let ctid_u64 = item_pointer_to_u64(ctid);
-    let results = search_index.search(
-        false,
-        false,
-        &SearchQueryInput::Term {
-            field: Some("ctid".into()),
-            value: ctid_u64.into(),
-            is_datetime: false,
-        },
-        None,
-    );
+    let query = SearchQueryInput::Term {
+        field: Some("ctid".into()),
+        value: ctid_u64.into(),
+        is_datetime: false,
+    };
+    let search_index = SearchIndexReader::open(&index, query, false, MvccSatisfies::Snapshot)?;
+    let results = search_index.search(None);
 
     let results = results
         .map(|(_, doc_address)| {
@@ -324,10 +249,10 @@ fn validate_checksum(index: PgRelation) -> Result<SetOfIterator<'static, String>
     // Because we accept a PgRelation above, we have confidence that Postgres has already
     // validated the existence of the relation. We are safe calling the function below as
     // long we do not pass pg_sys::NoLock without any other locking mechanism of our own.
-    let index = unsafe { PgRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _) };
+    let index = PgSearchRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _);
 
     // open the specified index
-    let search_reader = SearchIndexReader::open(&index, MvccSatisfies::Snapshot)?;
+    let search_reader = SearchIndexReader::empty(&index, MvccSatisfies::Snapshot)?;
 
     let failed = search_reader.validate_checksum()?;
     Ok(SetOfIterator::new(
@@ -343,8 +268,8 @@ fn create_bm25_jsonb() {}
 fn storage_info(
     index: PgRelation,
 ) -> TableIterator<'static, (name!(block, i64), name!(max_offset, i32))> {
-    let segment_components =
-        LinkedItemList::<SegmentMetaEntry>::open(index.oid(), SEGMENT_METAS_START);
+    let index = PgSearchRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _);
+    let segment_components = LinkedItemList::<SegmentMetaEntry>::open(&index, SEGMENT_METAS_START);
     let bman = segment_components.bman();
     let (mut blockno, mut buffer) = segment_components.get_start_blockno();
     let mut data = vec![];
@@ -377,8 +302,9 @@ fn page_info(
         ),
     >,
 > {
+    let index = PgSearchRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _);
     let mut segment_components =
-        LinkedItemList::<SegmentMetaEntry>::open(index.oid(), SEGMENT_METAS_START);
+        LinkedItemList::<SegmentMetaEntry>::open(&index, SEGMENT_METAS_START);
     let bman = segment_components.bman_mut();
     let buffer = bman.get_buffer(blockno as pg_sys::BlockNumber);
     let page = buffer.page();
@@ -389,9 +315,6 @@ fn page_info(
     }
 
     let mut data = vec![];
-    let snapshot = unsafe { pg_sys::GetActiveSnapshot() };
-    let heap_oid = unsafe { pg_sys::IndexGetRelation(index.oid(), false) };
-    let heap_relation = unsafe { pg_sys::RelationIdGetRelation(heap_oid) };
 
     for offsetno in pg_sys::FirstOffsetNumber..=max_offset {
         unsafe {
@@ -399,7 +322,7 @@ fn page_info(
                 data.push((
                     offsetno as i32,
                     size as i32,
-                    entry.visible(snapshot),
+                    entry.visible(),
                     entry.recyclable(bman),
                     JsonB(serde_json::to_value(entry)?),
                 ))
@@ -409,7 +332,6 @@ fn page_info(
         }
     }
 
-    unsafe { pg_sys::RelationClose(heap_relation) };
     Ok(TableIterator::new(data))
 }
 
@@ -462,17 +384,17 @@ fn force_merge_raw_bytes(
     oversized_layer_size_bytes: i64,
 ) -> anyhow::Result<TableIterator<'static, (name!(new_segments, i64), name!(merged_segments, i64))>>
 {
-    let index = unsafe {
+    let index = {
         let oid = index.oid();
         drop(index);
 
         // reopen the index with a RowExclusiveLock b/c we are going to be changing its physical structure
-        PgRelation::with_lock(oid, pg_sys::RowExclusiveLock as _)
+        PgSearchRelation::with_lock(oid, pg_sys::RowExclusiveLock as _)
     };
 
     let merge_policy = LayeredMergePolicy::new(vec![oversized_layer_size_bytes.try_into()?]);
     let (ncandidates, nmerged) =
-        unsafe { merge_index_with_policy(index, merge_policy, true, true, true) };
+        unsafe { merge_index_with_policy(&index, merge_policy, true, true, true) };
     Ok(TableIterator::once((
         ncandidates.try_into()?,
         nmerged.try_into()?,
@@ -482,10 +404,18 @@ fn force_merge_raw_bytes(
 #[pg_extern]
 fn merge_lock_garbage_collect(index: PgRelation) -> SetOfIterator<'static, i32> {
     unsafe {
-        let mut merge_lock = MergeLock::acquire(index.oid());
-        let before = merge_lock.in_progress_merge_entries();
-        merge_lock.garbage_collect();
-        let after = merge_lock.in_progress_merge_entries();
+        let index = {
+            let oid = index.oid();
+            drop(index);
+            // reopen the index with a RowExclusiveLock b/c we are going to be changing its physical structure
+            PgSearchRelation::with_lock(oid, pg_sys::RowExclusiveLock as _)
+        };
+        let metadata = MetaPage::open(&index);
+        let merge_lock = metadata.acquire_merge_lock();
+        let mut merge_list = merge_lock.merge_list();
+        let before = merge_list.list();
+        merge_list.garbage_collect();
+        let after = merge_list.list();
         drop(merge_lock);
 
         let before_pids = before

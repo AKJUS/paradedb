@@ -2,9 +2,9 @@ mod fixtures;
 
 use fixtures::*;
 use rstest::*;
+use rustc_hash::FxHashSet as HashSet;
 use serde_json::Value;
 use sqlx::PgConnection;
-use std::collections::HashSet;
 
 /// Helper function to verify that a query plan uses ParadeDB's custom scan operator
 /// This checks if the plan node is either:
@@ -144,6 +144,7 @@ fn pushdown(mut conn: PgConnection) {
     "SET enable_indexscan TO off;".execute(&mut conn);
     "SET enable_bitmapscan TO off;".execute(&mut conn);
     "SET max_parallel_workers TO 0;".execute(&mut conn);
+    "SET paradedb.enable_custom_scan_without_operator TO on;".execute(&mut conn);
 
     for operator in OPERATORS {
         for [sqltype, default] in TYPES {
@@ -153,8 +154,7 @@ fn pushdown(mut conn: PgConnection) {
                 EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON)
                 SELECT count(*)
                 FROM test
-                WHERE {sqlname} {operator} {default}::{sqltype}
-                  AND id @@@ '1';
+                WHERE {sqlname} {operator} {default}::{sqltype};
             "#
             );
 
@@ -177,8 +177,7 @@ fn pushdown(mut conn: PgConnection) {
                 EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON)
                 SELECT count(*)
                 FROM test
-                WHERE {sqlname} = true
-                  AND id @@@ '1';
+                WHERE {sqlname} = true;
             "#
         );
 
@@ -198,8 +197,7 @@ fn pushdown(mut conn: PgConnection) {
                 EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON)
                 SELECT count(*)
                 FROM test
-                WHERE {sqlname} = false
-                  AND id @@@ '1';
+                WHERE {sqlname} = false;
             "#
         );
 
@@ -227,7 +225,7 @@ fn issue2301_is_null_with_joins(mut conn: PgConnection) {
             removed_at timestamp with time zone
         );
         CREATE INDEX mcp_server_search_idx ON mcp_server
-        USING bm25 (id, name, description)
+        USING bm25 (id, name, description, synced_at, removed_at)
         WITH (key_field='id');
     "#
     .execute(&mut conn);
@@ -840,7 +838,7 @@ mod pushdown_is_bool_operator {
 
     INSERT INTO is_true (bool_field, message) VALUES (true, 'beer');
     INSERT INTO is_true (bool_field, message) VALUES (false, 'beer');
-    
+
     CREATE OR REPLACE FUNCTION is_true_test(b boolean) RETURNS boolean AS $$
     BEGIN
         RETURN b;

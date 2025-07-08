@@ -15,14 +15,20 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+use super::expression::PG_SEARCH_PREFIX;
+use crate::api::{FieldName, HashMap};
 use crate::index::writer::index::IndexError;
+use crate::postgres::build::is_bm25_index;
+use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::types::TantivyValue;
-use crate::schema::{SearchDocument, SearchField, SearchIndexSchema};
+use crate::schema::{CategorizedFieldData, SearchField, SearchFieldType};
 use anyhow::{anyhow, Result};
 use chrono::{NaiveDate, NaiveTime};
 use pgrx::itemptr::{item_pointer_get_both, item_pointer_set_all};
 use pgrx::*;
+use rustc_hash::FxHashMap;
 use std::str::FromStr;
+use tantivy::schema::OwnedValue;
 
 extern "C-unwind" {
     // SAFETY: `IsTransactionState()` doesn't raise an ERROR.  As such, we can avoid the pgrx
@@ -32,19 +38,20 @@ extern "C-unwind" {
 
 /// Finds and returns the `USING bm25` index on the specified relation with the
 /// highest OID, or [`None`] if there aren't any.
-pub fn locate_bm25_index(heaprelid: pg_sys::Oid) -> Option<PgRelation> {
+pub fn locate_bm25_index(heaprelid: pg_sys::Oid) -> Option<PgSearchRelation> {
+    locate_bm25_index_from_heaprel(&PgSearchRelation::open(heaprelid))
+}
+
+/// Finds and returns the `USING bm25` index on the specified relation with the
+/// highest OID, or [`None`] if there aren't any.
+pub fn locate_bm25_index_from_heaprel(heaprel: &PgSearchRelation) -> Option<PgSearchRelation> {
     unsafe {
-        let heaprel = PgRelation::open(heaprelid);
         let indices = heaprel.indices(pg_sys::AccessShareLock as _);
 
         // Find all bm25 indexes and keep the one with highest OID
         indices
             .into_iter()
-            .filter(|index| pg_sys::get_index_isvalid(index.oid()))
-            .filter(|index| {
-                !index.rd_indam.is_null()
-                    && (*index.rd_indam).ambuild == Some(crate::postgres::build::ambuild)
-            })
+            .filter(|index| pg_sys::get_index_isvalid(index.oid()) && is_bm25_index(index))
             .max_by_key(|index| index.oid().to_u32())
     }
 }
@@ -78,68 +85,68 @@ pub fn u64_to_item_pointer(value: u64, tid: &mut pg_sys::ItemPointerData) {
     item_pointer_set_all(tid, blockno, offno);
 }
 
-pub struct CategorizedFieldData {
+/// Represents the metadata extracted from an index attribute
+#[derive(Debug)]
+pub struct ExtractedFieldAttribute {
+    /// its ordinal position in the index attribute list
     pub attno: usize,
-    pub base_oid: PgOid,
-    pub is_array: bool,
-    pub is_json: bool,
+
+    /// its original Postgres type OID
+    pub pg_type: PgOid,
+
+    /// the type we'll use for indexing in tantivy
+    pub tantivy_type: SearchFieldType,
 }
 
-pub fn categorize_fields(
-    tupdesc: &PgTupleDesc,
-    schema: &SearchIndexSchema,
-) -> Vec<(SearchField, CategorizedFieldData)> {
-    let mut categorized_fields = Vec::new();
+/// Extracts the field attributes from the index relation.
+/// It returns a vector of tuples containing the field name and its type OID.
+pub unsafe fn extract_field_attributes(
+    indexrel: pg_sys::Relation,
+) -> HashMap<FieldName, ExtractedFieldAttribute> {
+    let tupdesc = PgTupleDesc::from_pg_unchecked((*indexrel).rd_att);
+    let index_info = pg_sys::BuildIndexInfo(indexrel);
+    let expressions = PgList::<pg_sys::Expr>::from_pg((*index_info).ii_Expressions);
+    let mut expressions_iter = expressions.iter_ptr();
 
-    let mut alias_lookup = schema.alias_lookup();
-
-    // Create a vector of index entries from the postgres row.
-    for (attno, attribute) in tupdesc.iter().enumerate() {
-        let attname = attribute.name().to_string();
-        let attribute_type_oid = attribute.type_oid();
-
-        // List any indexed fields that use this column as source data.
-        let mut search_fields = alias_lookup.remove(&attname).unwrap_or_default();
-
-        // If there's an indexed field with the same name as a this column, add it to the list.
-        if let Some(index_field) = schema.get_search_field(&attname.clone().into()) {
-            search_fields.push(index_field)
+    let mut field_attributes: FxHashMap<FieldName, ExtractedFieldAttribute> = Default::default();
+    for attno in 0..(*index_info).ii_NumIndexAttrs {
+        let heap_attno = (*index_info).ii_IndexAttrNumbers[attno as usize];
+        let (attname, attribute_type_oid) = if heap_attno == 0 {
+            // Is an expression.
+            let Some(expression) = expressions_iter.next() else {
+                panic!("Expected expression for index attribute {attno}.");
+            };
+            let node = expression.cast();
+            (
+                format!("{PG_SEARCH_PREFIX}{attno}").into(),
+                pg_sys::exprType(node),
+            )
+        } else {
+            // Is a field.
+            let att = tupdesc.get(attno as usize).expect("attribute should exist");
+            (att.name().to_owned().into(), att.type_oid().value())
         };
 
-        for search_field in search_fields {
-            let array_type = unsafe { pg_sys::get_element_type(attribute_type_oid.value()) };
-            let (base_oid, is_array) = if array_type != pg_sys::InvalidOid {
-                (PgOid::from(array_type), true)
-            } else {
-                (attribute_type_oid, false)
-            };
-
-            let is_json = matches!(
-                base_oid,
-                PgOid::BuiltIn(pg_sys::BuiltinOid::JSONBOID | pg_sys::BuiltinOid::JSONOID)
-            );
-
-            categorized_fields.push((
-                search_field.clone(),
-                CategorizedFieldData {
-                    attno,
-                    base_oid,
-                    is_array,
-                    is_json,
-                },
-            ));
-        }
+        let pg_type = PgOid::from_untagged(attribute_type_oid);
+        let tantivy_type = SearchFieldType::try_from(pg_type).unwrap_or_else(|e| panic!("{e}"));
+        field_attributes.insert(
+            attname,
+            ExtractedFieldAttribute {
+                attno: attno as usize,
+                pg_type,
+                tantivy_type,
+            },
+        );
     }
-
-    categorized_fields
+    field_attributes
 }
 
 pub unsafe fn row_to_search_document(
     values: *mut pg_sys::Datum,
     isnull: *mut bool,
-    key_field_name: &str,
+    key_field_name: &FieldName,
     categorized_fields: &Vec<(SearchField, CategorizedFieldData)>,
-    document: &mut SearchDocument,
+    document: &mut tantivy::TantivyDocument,
 ) -> Result<(), IndexError> {
     for (
         search_field,
@@ -154,7 +161,7 @@ pub unsafe fn row_to_search_document(
         let datum = *values.add(*attno);
         let isnull = *isnull.add(*attno);
 
-        if isnull && key_field_name == search_field.name.as_ref() {
+        if isnull && key_field_name == search_field.field_name() {
             return Err(IndexError::KeyIdNull(key_field_name.to_string()));
         }
 
@@ -164,16 +171,16 @@ pub unsafe fn row_to_search_document(
 
         if *is_array {
             for value in TantivyValue::try_from_datum_array(datum, *base_oid)? {
-                document.insert(search_field.id, value.into());
+                document.add_field_value(search_field.field(), &OwnedValue::from(value));
             }
         } else if *is_json {
             for value in TantivyValue::try_from_datum_json(datum, *base_oid)? {
-                document.insert(search_field.id, value.into());
+                document.add_field_value(search_field.field(), &OwnedValue::from(value));
             }
         } else {
-            document.insert(
-                search_field.id,
-                TantivyValue::try_from_datum(datum, *base_oid)?.into(),
+            document.add_field_value(
+                search_field.field(),
+                &OwnedValue::from(TantivyValue::try_from_datum(datum, *base_oid)?),
             );
         }
     }
@@ -274,5 +281,52 @@ pub fn convert_pg_date_string(typeoid: PgOid, date_string: &str) -> tantivy::Dat
             tantivy::DateTime::from_timestamp_micros(micros)
         }
         _ => panic!("Unsupported typeoid: {typeoid:?}"),
+    }
+}
+
+type IsArray = bool;
+/// Returns the base type of the given `oid`, and a boolean indicating if the
+/// type is an array.
+pub fn resolve_base_type(oid: PgOid) -> Option<(PgOid, IsArray)> {
+    fn is_domain_type(oid: pg_sys::Oid) -> bool {
+        unsafe { pg_sys::get_typtype(oid) as u8 == pg_sys::TYPTYPE_DOMAIN }
+    }
+
+    if matches!(oid, PgOid::Invalid) {
+        return None;
+    }
+
+    // resolve domain type to its base
+    let base_oid = if is_domain_type(oid.value()) {
+        let resolved_type = unsafe { pg_sys::getBaseType(oid.value()) };
+        if resolved_type == pg_sys::InvalidOid {
+            return None;
+        }
+        resolved_type
+    } else {
+        oid.value()
+    };
+
+    // check if it's an array type
+    let array_type = PgOid::from(unsafe { pg_sys::get_element_type(base_oid) });
+
+    match array_type {
+        // not an array
+        PgOid::Invalid => Some((base_oid.into(), false)),
+
+        // built-in array type or custom array type
+        PgOid::BuiltIn(_) | PgOid::Custom(_) => {
+            let resolved_array_type = if is_domain_type(array_type.value()) {
+                let resolved_type = unsafe { pg_sys::getBaseType(array_type.value()) };
+                if resolved_type == pg_sys::InvalidOid {
+                    return None;
+                }
+                resolved_type
+            } else {
+                array_type.value()
+            };
+
+            Some((resolved_array_type.into(), true))
+        }
     }
 }

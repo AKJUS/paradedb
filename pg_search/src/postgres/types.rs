@@ -31,9 +31,10 @@ use serde_json::Value;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::net::{AddrParseError, IpAddr};
 use std::num::ParseFloatError;
 use std::str::FromStr;
-use tantivy::schema::OwnedValue;
+use tantivy::schema::{IntoIpv6Addr, OwnedValue};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq, PostgresType)]
@@ -89,6 +90,7 @@ impl TantivyValue {
                         pgrx::datum::TimeWithTimeZone::try_from(self)?.into_datum()
                     }
                     PgBuiltInOids::UUIDOID => pgrx::datum::Uuid::try_from(self)?.into_datum(),
+                    PgBuiltInOids::INETOID => pgrx::datum::Inet::try_from(self)?.into_datum(),
                     _ => return Err(TantivyValueError::UnsupportedOid(oid.value())),
                 };
                 Ok(datum)
@@ -133,7 +135,8 @@ impl TantivyValue {
                 | PgBuiltInOids::TIMESTAMPTZOID
                 | PgBuiltInOids::TIMEOID
                 | PgBuiltInOids::TIMETZOID
-                | PgBuiltInOids::UUIDOID => {
+                | PgBuiltInOids::UUIDOID
+                | PgBuiltInOids::INETOID => {
                     let array: pgrx::Array<Datum> = pgrx::Array::from_datum(datum, false)
                         .ok_or(TantivyValueError::DatumDeref)?;
                     array
@@ -228,6 +231,10 @@ impl TantivyValue {
                     pgrx::datum::Uuid::from_datum(datum, false)
                         .ok_or(TantivyValueError::DatumDeref)?,
                 ),
+                PgBuiltInOids::INETOID => TantivyValue::try_from(
+                    pgrx::datum::Inet::from_datum(datum, false)
+                        .ok_or(TantivyValueError::DatumDeref)?,
+                ),
                 PgBuiltInOids::INT4RANGEOID => TantivyValue::from_range(
                     pgrx::datum::Range::<i32>::from_datum(datum, false)
                         .ok_or(TantivyValueError::DatumDeref)?,
@@ -282,10 +289,10 @@ impl fmt::Display for TantivyValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.tantivy_schema_value() {
             tantivy::schema::OwnedValue::Str(string) => write!(f, "{}", string.clone()),
-            tantivy::schema::OwnedValue::U64(u64) => write!(f, "{}", u64),
-            tantivy::schema::OwnedValue::I64(i64) => write!(f, "{}", i64),
-            tantivy::schema::OwnedValue::F64(f64) => write!(f, "{}", f64),
-            tantivy::schema::OwnedValue::Bool(bool) => write!(f, "{}", bool),
+            tantivy::schema::OwnedValue::U64(u64) => write!(f, "{u64}"),
+            tantivy::schema::OwnedValue::I64(i64) => write!(f, "{i64}"),
+            tantivy::schema::OwnedValue::F64(f64) => write!(f, "{f64}"),
+            tantivy::schema::OwnedValue::Bool(bool) => write!(f, "{bool}"),
             tantivy::schema::OwnedValue::Date(datetime) => {
                 write!(f, "{}", datetime.into_primitive())
             }
@@ -296,7 +303,9 @@ impl fmt::Display for TantivyValue {
                     String::from_utf8(bytes.clone()).expect("bytes should be valid utf-8")
                 )
             }
+            tantivy::schema::OwnedValue::IpAddr(addr) => write!(f, "{addr}"),
             tantivy::schema::OwnedValue::Object(_) => write!(f, "json object"),
+            tantivy::schema::OwnedValue::Null => write!(f, "<null>"),
             _ => panic!("tantivy owned value not supported"),
         }
     }
@@ -312,6 +321,7 @@ impl Hash for TantivyValue {
             tantivy::schema::OwnedValue::Bool(bool) => bool.hash(state),
             tantivy::schema::OwnedValue::Date(datetime) => datetime.hash(state),
             tantivy::schema::OwnedValue::Bytes(bytes) => bytes.hash(state),
+            tantivy::schema::OwnedValue::Null => 0_u8.hash(state),
             _ => panic!("tantivy owned value not supported"),
         }
     }
@@ -533,7 +543,7 @@ impl TryFrom<f32> for TantivyValue {
     fn try_from(val: f32) -> Result<Self, Self::Error> {
         // Casting f32 to f64 causes some precision errors when Tantivy writes the document.
         //     To avoid this, we string format the f32 and then read it as f64.
-        let f32_string = format!("{}", val);
+        let f32_string = format!("{val}");
         let val_as_f64 = f64::from_str(&f32_string)?;
 
         Ok(TantivyValue(tantivy::schema::OwnedValue::F64(val_as_f64)))
@@ -547,7 +557,7 @@ impl TryFrom<TantivyValue> for f32 {
         if let tantivy::schema::OwnedValue::F64(val) = value.0 {
             // Casting f32 to f64 causes some precision errors when Tantivy writes the document.
             //     To avoid this, we string format the stored f64 and then read it as f32.
-            let f64_string = format!("{}", val);
+            let f64_string = format!("{val}");
             let val_as_f32 = f32::from_str(&f64_string)?;
 
             Ok(val_as_f32)
@@ -969,10 +979,27 @@ impl TryFrom<pgrx::pg_sys::ItemPointerData> for TantivyValue {
 impl TryFrom<pgrx::Inet> for TantivyValue {
     type Error = TantivyValueError;
 
-    fn try_from(_val: pgrx::Inet) -> Result<Self, Self::Error> {
-        Err(TantivyValueError::UnsupportedFromConversion(
-            "inet".to_string(),
-        ))
+    fn try_from(val: pgrx::Inet) -> Result<Self, Self::Error> {
+        match val.parse::<IpAddr>() {
+            Ok(addr) => Ok(TantivyValue(tantivy::schema::OwnedValue::IpAddr(
+                addr.into_ipv6_addr(),
+            ))),
+            Err(err) => Err(TantivyValueError::InetError(err)),
+        }
+    }
+}
+
+impl TryFrom<TantivyValue> for pgrx::Inet {
+    type Error = TantivyValueError;
+
+    fn try_from(value: TantivyValue) -> Result<Self, Self::Error> {
+        if let tantivy::schema::OwnedValue::IpAddr(val) = value.0 {
+            Ok(val.to_string().into())
+        } else {
+            Err(TantivyValueError::UnsupportedIntoConversion(
+                "inet".to_string(),
+            ))
+        }
     }
 }
 
@@ -989,6 +1016,9 @@ pub enum TantivyValueError {
 
     #[error("Failed UUID conversion: {0}")]
     UuidConversionError(String),
+
+    #[error(transparent)]
+    InetError(#[from] AddrParseError),
 
     #[error("Could not dereference postgres datum")]
     DatumDeref,

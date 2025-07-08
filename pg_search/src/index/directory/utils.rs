@@ -1,13 +1,14 @@
+use crate::api::{HashMap, HashSet};
 use crate::index::mvcc::{MvccSatisfies, PinCushion};
+use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::storage::block::{
     DeleteEntry, FileEntry, LinkedList, MVCCEntry, PgItem, SegmentFileDetails, SegmentMetaEntry,
     SCHEMA_START, SEGMENT_METAS_START, SETTINGS_START,
 };
-use crate::postgres::storage::merge::MergeLock;
+use crate::postgres::storage::metadata::MetaPage;
 use crate::postgres::storage::{LinkedBytesList, LinkedItemList};
 use anyhow::Result;
 use pgrx::pg_sys;
-use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -18,8 +19,8 @@ use tantivy::{
     IndexMeta,
 };
 
-pub fn save_schema(relation_oid: pg_sys::Oid, tantivy_schema: &Schema) -> Result<()> {
-    let schema = LinkedBytesList::open(relation_oid, SCHEMA_START);
+pub fn save_schema(indexrel: &PgSearchRelation, tantivy_schema: &Schema) -> Result<()> {
+    let schema = LinkedBytesList::open(indexrel, SCHEMA_START);
     if schema.is_empty() {
         let bytes = serde_json::to_vec(tantivy_schema)?;
         unsafe {
@@ -29,8 +30,8 @@ pub fn save_schema(relation_oid: pg_sys::Oid, tantivy_schema: &Schema) -> Result
     Ok(())
 }
 
-pub fn save_settings(relation_oid: pg_sys::Oid, tantivy_settings: &IndexSettings) -> Result<()> {
-    let settings = LinkedBytesList::open(relation_oid, SETTINGS_START);
+pub fn save_settings(indexrel: &PgSearchRelation, tantivy_settings: &IndexSettings) -> Result<()> {
+    let settings = LinkedBytesList::open(indexrel, SETTINGS_START);
     if settings.is_empty() {
         let bytes = serde_json::to_vec(tantivy_settings)?;
         unsafe {
@@ -41,36 +42,36 @@ pub fn save_settings(relation_oid: pg_sys::Oid, tantivy_settings: &IndexSettings
 }
 
 pub unsafe fn save_new_metas(
-    relation_oid: pg_sys::Oid,
+    indexrel: &PgSearchRelation,
     new_meta: &IndexMeta,
     prev_meta: &IndexMeta,
-    directory_entries: &mut FxHashMap<PathBuf, FileEntry>,
+    directory_entries: &mut HashMap<PathBuf, FileEntry>,
 ) -> Result<()> {
     // in order to ensure that all of our mutations to the list of segments appear atomically on
     // physical replicas, we atomically operate on a deep copy of the list.
     let mut segment_metas_linked_list =
-        LinkedItemList::<SegmentMetaEntry>::open(relation_oid, SEGMENT_METAS_START);
+        LinkedItemList::<SegmentMetaEntry>::open(indexrel, SEGMENT_METAS_START);
     let mut linked_list = segment_metas_linked_list.atomically();
 
     let incoming_segments = new_meta
         .segments
         .iter()
         .map(|s| (s.id(), s))
-        .collect::<FxHashMap<_, _>>();
+        .collect::<HashMap<_, _>>();
     let new_ids = new_meta
         .segments
         .iter()
         .map(|s| s.id())
-        .collect::<FxHashSet<_>>();
+        .collect::<HashSet<_>>();
     let previous_ids = prev_meta
         .segments
         .iter()
         .map(|s| s.id())
-        .collect::<FxHashSet<_>>();
+        .collect::<HashSet<_>>();
 
     // first, reorganize the directory_entries by segment id
     let mut new_files =
-        FxHashMap::<SegmentId, FxHashMap<SegmentComponent, (FileEntry, PathBuf)>>::default();
+        HashMap::<SegmentId, HashMap<SegmentComponent, (FileEntry, PathBuf)>>::default();
 
     for (path, file_entry) in directory_entries.drain() {
         let segment_id = path.segment_id();
@@ -114,18 +115,7 @@ pub unsafe fn save_new_metas(
             let meta_entry = SegmentMetaEntry {
                 segment_id: *id,
                 max_doc: created_segment.max_doc(),
-                xmin: if deleted_ids.is_empty() {
-                    // this is a new segment created by a tantivy index .commit()
-                    pg_sys::GetCurrentTransactionId()
-                } else {
-                    // this is a new segment created by a tantivy merge.  in this case it's imperative
-                    // this segment, which contains tuples that have previously bee on disk, be
-                    // written to a transaction that is known to be "not in progress anymore".  This
-                    // is because the data in this segment came from a transaction that was not in
-                    // progress and changing their "in progress" state will upset our visibility
-                    // expectations
-                    pg_sys::FrozenTransactionId
-                },
+                _unused: pg_sys::InvalidTransactionId,
                 xmax: pg_sys::InvalidTransactionId,
                 postings: files.remove(&SegmentComponent::Postings).map(|e| e.0),
                 positions: files.remove(&SegmentComponent::Positions).map(|e| e.0),
@@ -308,16 +298,9 @@ pub unsafe fn save_new_metas(
             .map(|(_, delete_entry)| SegmentMetaEntry {
                 segment_id: SegmentId::from_bytes([0; 16]), // all zeros
                 max_doc: delete_entry.num_deleted_docs,
-                xmin: pg_sys::FrozenTransactionId,
                 xmax: pg_sys::FrozenTransactionId, // immediately recyclable
-                postings: None,
-                positions: None,
-                fast_fields: None,
-                field_norms: None,
-                terms: None,
-                store: None,
-                temp_store: None,
                 delete: Some(delete_entry), // the file whose bytes we need to ensure get garbage collected in the future
+                ..Default::default()
             })
             .collect::<Vec<_>>();
         linked_list.add_items(&fake_entries, None);
@@ -329,22 +312,31 @@ pub unsafe fn save_new_metas(
     Ok(())
 }
 
+pub struct LoadedMetas {
+    pub entries: Vec<SegmentMetaEntry>,
+    pub meta: IndexMeta,
+    pub pin_cushion: PinCushion,
+    pub total_segments: usize,
+}
+
 pub unsafe fn load_metas(
-    relation_oid: pg_sys::Oid,
+    indexrel: &PgSearchRelation,
     inventory: &SegmentMetaInventory,
-    snapshot: Option<pg_sys::Snapshot>,
     solve_mvcc: &MvccSatisfies,
-) -> tantivy::Result<(Vec<SegmentMetaEntry>, IndexMeta, PinCushion)> {
+    tantivy_schema: &Schema,
+) -> tantivy::Result<LoadedMetas> {
+    let mut total_segments = 0;
     let mut alive_segments = vec![];
     let mut alive_entries = vec![];
     let mut opstamp = None;
     let mut pin_cushion = PinCushion::default();
 
     // Collect segments from each relevant list.
-    let mut segment_metas =
-        LinkedItemList::<SegmentMetaEntry>::open(relation_oid, SEGMENT_METAS_START);
+    let mut segment_metas = LinkedItemList::<SegmentMetaEntry>::open(indexrel, SEGMENT_METAS_START);
     let mut exhausted_metas_lists = false;
 
+    let is_largest_only = &MvccSatisfies::LargestSegment == solve_mvcc;
+    let mut largest_doc_count = 0;
     loop {
         // Find all relevant segments in this list.
         segment_metas.for_each(|bman, entry| {
@@ -353,33 +345,54 @@ pub unsafe fn load_metas(
                 // parallel workers only see a specific set of segments.  This relies on the leader having kept a pin on them
                 matches!(solve_mvcc, MvccSatisfies::ParallelWorker(only_these) if only_these.contains(&entry.segment_id))
 
-                // vacuum sees everything that hasn't been deleted by a merge
-                || (matches!(solve_mvcc, MvccSatisfies::Vacuum) && entry.xmax == pg_sys::InvalidTransactionId)
+                    // vacuum sees everything that hasn't been deleted by a merge
+                    || (matches!(solve_mvcc, MvccSatisfies::Vacuum) && entry.xmax == pg_sys::InvalidTransactionId)
 
-                // a snapshot can see any that are visible in its snapshot
-                || (matches!(solve_mvcc, MvccSatisfies::Snapshot) && entry.visible(snapshot.expect("snapshot must be provided for `MvccSatisfies::Snapshot`")))
+                    // a snapshot or ::LargestSegment can see any that are visible in its snapshot
+                    || (matches!(solve_mvcc, MvccSatisfies::Snapshot | MvccSatisfies::LargestSegment) && entry.visible())
 
-                // mergeable can see any that are known to be mergeable
-                || (matches!(solve_mvcc, MvccSatisfies::Mergeable) && entry.mergeable())
+                    // mergeable can see any that are known to be mergeable
+                    || (matches!(solve_mvcc, MvccSatisfies::Mergeable) && entry.mergeable())
             );
             if !accept {
                 return;
             };
 
-            pin_cushion.push(bman, &entry);
-            let inner_segment_meta = InnerSegmentMeta {
-                max_doc: entry.max_doc,
-                segment_id: entry.segment_id,
-                deletes: entry.delete.map(|delete_entry| DeleteMeta {
-                    num_deleted_docs: delete_entry.num_deleted_docs,
-                    opstamp: 0, // hardcode zero as the entry's opstamp as it's not used
-                }),
-                include_temp_doc_store: Arc::new(AtomicBool::new(false)),
-            };
-            alive_segments.push(inner_segment_meta.track(inventory));
-            alive_entries.push(entry);
+            total_segments += 1;
 
-            opstamp = opstamp.max(Some(entry.opstamp()));
+            let mut need_entry = true;
+            if is_largest_only {
+                if entry.num_docs() > largest_doc_count {
+                    largest_doc_count = entry.num_docs();
+
+                    // the entry we're processing right now is known to be the largest so far
+                    // and it's the only one we want
+                    alive_segments.clear();
+                    alive_entries.clear();
+                    pin_cushion.clear();
+                } else {
+                    // we already have the largest so we don't need this entry
+                    need_entry = false;
+                }
+            }
+
+            if need_entry {
+                pin_cushion.push(bman, &entry);
+                let inner_segment_meta = InnerSegmentMeta {
+                    max_doc: entry.max_doc,
+                    segment_id: entry.segment_id,
+                    deletes: entry.delete.map(|delete_entry| DeleteMeta {
+                        num_deleted_docs: delete_entry.num_deleted_docs,
+                        opstamp: 0, // hardcode zero as the entry's opstamp as it's not used
+                    }),
+                    include_temp_doc_store: Arc::new(AtomicBool::new(false)),
+                };
+
+                alive_segments.push(inner_segment_meta.track(inventory));
+                alive_entries.push(entry);
+
+                opstamp = opstamp.max(Some(entry.opstamp()));
+            }
         });
 
         match solve_mvcc {
@@ -388,9 +401,7 @@ pub unsafe fn load_metas(
             {
                 // If we haven't tried the `segment_metas_garbage` list, try that next.
                 if !exhausted_metas_lists {
-                    if let Some(garbage) =
-                        MergeLock::acquire(relation_oid).segment_metas_garbage_opt()
-                    {
+                    if let Some(garbage) = MetaPage::open(indexrel).segment_metas_garbage() {
                         segment_metas = garbage;
                         exhausted_metas_lists = true;
                         continue;
@@ -400,8 +411,8 @@ pub unsafe fn load_metas(
                 let missing = only_these
                     .difference(&alive_entries.iter().map(|s| s.segment_id).collect())
                     .cloned()
-                    .collect::<std::collections::HashSet<SegmentId>>();
-                let found = only_these.difference(&missing).collect::<FxHashSet<_>>();
+                    .collect::<HashSet<SegmentId>>();
+                let found = only_these.difference(&missing).collect::<HashSet<_>>();
 
                 panic!(
                     "load_metas: MvccSatisfies::ParallelWorker didn't load the correct segments. \
@@ -415,7 +426,7 @@ pub unsafe fn load_metas(
                 let actual = alive_entries
                     .iter()
                     .map(|s| s.segment_id)
-                    .collect::<std::collections::HashSet<_>>();
+                    .collect::<HashSet<_>>();
                 assert_eq!(
                     &actual, only_these,
                     "Got the wrong segments in parallel worker: \
@@ -430,20 +441,27 @@ pub unsafe fn load_metas(
         }
     }
 
-    let schema = LinkedBytesList::open(relation_oid, SCHEMA_START);
-    let settings = LinkedBytesList::open(relation_oid, SETTINGS_START);
-    let deserialized_schema = serde_json::from_slice(&schema.read_all())?;
+    let settings = LinkedBytesList::open(indexrel, SETTINGS_START);
     let deserialized_settings = serde_json::from_slice(&settings.read_all())?;
 
-    Ok((
-        alive_entries,
-        IndexMeta {
+    Ok(LoadedMetas {
+        entries: alive_entries,
+        meta: IndexMeta {
             segments: alive_segments,
-            schema: deserialized_schema,
+            schema: tantivy_schema.clone(),
             index_settings: deserialized_settings,
             opstamp: opstamp.unwrap_or(0),
             payload: None,
         },
         pin_cushion,
-    ))
+        total_segments,
+    })
+}
+
+pub fn load_index_schema(indexrel: &PgSearchRelation) -> tantivy::Result<Option<Schema>> {
+    let schema_bytes = unsafe { LinkedBytesList::open(indexrel, SCHEMA_START).read_all() };
+    if schema_bytes.is_empty() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_slice(&schema_bytes)?)
 }

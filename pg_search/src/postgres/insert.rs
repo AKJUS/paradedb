@@ -15,42 +15,48 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+use crate::api::FieldName;
+use crate::gucs;
 use crate::index::merge_policy::{LayeredMergePolicy, NumCandidates, NumMerged};
 use crate::index::mvcc::MvccSatisfies;
-use crate::index::writer::index::{Mergeable, SearchIndexMerger, SearchIndexWriter};
-use crate::index::WriterResources;
-use crate::postgres::options::SearchIndexCreateOptions;
+use crate::index::writer::index::{
+    IndexWriterConfig, Mergeable, SearchIndexMerger, SerialIndexWriter,
+};
+use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::storage::block::{SegmentMetaEntry, CLEANUP_LOCK, SEGMENT_METAS_START};
 use crate::postgres::storage::buffer::BufferManager;
-use crate::postgres::storage::merge::MergeLock;
+use crate::postgres::storage::metadata::MetaPage;
 use crate::postgres::storage::{LinkedBytesList, LinkedItemList};
-use crate::postgres::utils::{
-    categorize_fields, item_pointer_to_u64, row_to_search_document, CategorizedFieldData,
-};
-use crate::schema::SearchField;
-use pgrx::{check_for_interrupts, pg_guard, pg_sys, PgMemoryContexts, PgRelation, PgTupleDesc};
-use std::ffi::CStr;
+use crate::postgres::utils::{item_pointer_to_u64, row_to_search_document};
+use crate::schema::{CategorizedFieldData, SearchField};
+use pgrx::{check_for_interrupts, pg_guard, pg_sys, PgMemoryContexts};
 use std::panic::{catch_unwind, resume_unwind};
-use tantivy::SegmentMeta;
+use tantivy::{SegmentMeta, TantivyDocument};
 
 pub struct InsertState {
     #[allow(dead_code)] // field is used by pg<16 for the fakeaminsertcleanup stuff
     pub indexrelid: pg_sys::Oid,
-    pub writer: Option<SearchIndexWriter>,
+    pub writer: Option<SerialIndexWriter>,
     categorized_fields: Vec<(SearchField, CategorizedFieldData)>,
-    key_field_name: String,
+    key_field_name: FieldName,
     per_row_context: PgMemoryContexts,
 }
 
 impl InsertState {
-    unsafe fn new(
-        indexrel: &PgRelation,
-        writer_resources: WriterResources,
-    ) -> anyhow::Result<Self> {
-        let writer = SearchIndexWriter::open(indexrel, MvccSatisfies::Mergeable, writer_resources)?;
-        let tupdesc = unsafe { PgTupleDesc::from_pg_unchecked(indexrel.rd_att) };
-        let categorized_fields = categorize_fields(&tupdesc, &writer.schema);
-        let key_field_name = writer.schema.key_field().name.0;
+    unsafe fn new(indexrel: &PgSearchRelation) -> anyhow::Result<Self> {
+        let config = IndexWriterConfig {
+            memory_budget: gucs::adjust_work_mem(),
+            max_docs_per_segment: None,
+        };
+        let writer = SerialIndexWriter::with_mvcc(
+            indexrel,
+            MvccSatisfies::Mergeable,
+            config,
+            Default::default(),
+        )?;
+        let schema = writer.schema();
+        let categorized_fields = schema.categorized_fields().clone();
+        let key_field_name = schema.key_field_name();
 
         let per_row_context = pg_sys::AllocSetContextCreateExtended(
             PgMemoryContexts::CurrentMemoryContext.value(),
@@ -74,13 +80,12 @@ impl InsertState {
 unsafe fn init_insert_state(
     index_relation: pg_sys::Relation,
     index_info: &mut pg_sys::IndexInfo,
-    writer_resources: WriterResources,
 ) -> &'static mut InsertState {
     use crate::postgres::fake_aminsertcleanup::{get_insert_state, push_insert_state};
 
     if index_info.ii_AmCache.is_null() {
-        let index_relation = PgRelation::from_pg(index_relation);
-        let state = InsertState::new(&index_relation, writer_resources)
+        let index_relation = PgSearchRelation::from_pg(index_relation);
+        let state = InsertState::new(&index_relation)
             .expect("should be able to open new SearchIndex for writing");
 
         push_insert_state(state);
@@ -94,12 +99,11 @@ unsafe fn init_insert_state(
 pub unsafe fn init_insert_state(
     index_relation: pg_sys::Relation,
     index_info: &mut pg_sys::IndexInfo,
-    writer_resources: WriterResources,
 ) -> &mut InsertState {
     if index_info.ii_AmCache.is_null() {
         // we don't have any cached state yet, so create it now
-        let index_relation = PgRelation::from_pg(index_relation);
-        let state = InsertState::new(&index_relation, writer_resources)
+        let index_relation = PgSearchRelation::from_pg(index_relation);
+        let state = InsertState::new(&index_relation)
             .expect("should be able to open new SearchIndex for writing");
 
         // leak it into the MemoryContext for this scan (as specified by the IndexInfo argument)
@@ -122,21 +126,10 @@ pub unsafe extern "C-unwind" fn aminsert(
     index_relation: pg_sys::Relation,
     values: *mut pg_sys::Datum,
     isnull: *mut bool,
-    heap_tid: pg_sys::ItemPointer,
+    ctid: pg_sys::ItemPointer,
     _heap_relation: pg_sys::Relation,
     _check_unique: pg_sys::IndexUniqueCheck::Type,
     _index_unchanged: bool,
-    index_info: *mut pg_sys::IndexInfo,
-) -> bool {
-    aminsert_internal(index_relation, values, isnull, heap_tid, index_info)
-}
-
-#[inline(always)]
-unsafe fn aminsert_internal(
-    index_relation: pg_sys::Relation,
-    values: *mut pg_sys::Datum,
-    isnull: *mut bool,
-    ctid: pg_sys::ItemPointer,
     index_info: *mut pg_sys::IndexInfo,
 ) -> bool {
     if pg_sys::IsLogicalWorker() {
@@ -149,7 +142,6 @@ unsafe fn aminsert_internal(
             index_info
                 .as_mut()
                 .expect("index_info argument must not be null"),
-            WriterResources::Statement,
         );
 
         state.per_row_context.switch_to(|cxt| {
@@ -157,7 +149,7 @@ unsafe fn aminsert_internal(
             let key_field_name = &state.key_field_name;
             let writer = state.writer.as_mut().expect("writer should not be null");
 
-            let mut search_document = writer.schema.new_document();
+            let mut search_document = TantivyDocument::new();
 
             row_to_search_document(
                 values,
@@ -166,13 +158,7 @@ unsafe fn aminsert_internal(
                 categorized_fields,
                 &mut search_document,
             )
-            .unwrap_or_else(|err| {
-                panic!(
-                    "error creating index entries for index '{}': {err}",
-                    CStr::from_ptr((*(*index_relation).rd_rel).relname.data.as_ptr())
-                        .to_string_lossy()
-                );
-            });
+            .unwrap_or_else(|err| panic!("{err}"));
             writer
                 .insert(search_document, item_pointer_to_u64(*ctid))
                 .expect("insertion into index should succeed");
@@ -202,16 +188,15 @@ pub unsafe extern "C-unwind" fn aminsertcleanup(
     paradedb_aminsertcleanup(state.as_mut().and_then(|state| state.writer.take()));
 }
 
-pub fn paradedb_aminsertcleanup(mut writer: Option<SearchIndexWriter>) {
+pub fn paradedb_aminsertcleanup(mut writer: Option<SerialIndexWriter>) {
     if let Some(writer) = writer.take() {
-        let indexrelid = writer.indexrelid;
-
-        writer
+        if let Some((_, indexrel)) = writer
             .commit()
-            .expect("must be able to commit inserts in paradedb_aminsertcleanup");
-
-        unsafe {
-            do_merge(indexrelid);
+            .expect("must be able to commit inserts in paradedb_aminsertcleanup")
+        {
+            unsafe {
+                do_merge(indexrel);
+            }
         }
     }
 }
@@ -223,9 +208,8 @@ pub(crate) const DEFAULT_LAYER_SIZES: &[u64] = &[
     100 * 1024 * 1024, // 100MB
 ];
 
-unsafe fn do_merge(indexrelid: pg_sys::Oid) -> (NumCandidates, NumMerged) {
+unsafe fn do_merge(indexrel: PgSearchRelation) -> (NumCandidates, NumMerged) {
     let indexrel = {
-        let indexrel = PgRelation::open(indexrelid);
         let heaprel = indexrel
             .heap_relation()
             .expect("index should belong to a heap relation");
@@ -243,37 +227,37 @@ unsafe fn do_merge(indexrelid: pg_sys::Oid) -> (NumCandidates, NumMerged) {
         indexrel
     };
 
-    let index_options = SearchIndexCreateOptions::from_relation(&indexrel);
-    let merge_policy = LayeredMergePolicy::new(index_options.layer_sizes(DEFAULT_LAYER_SIZES));
+    let layer_sizes = indexrel.options().layer_sizes();
+    let merge_policy = LayeredMergePolicy::new(layer_sizes);
 
-    merge_index_with_policy(indexrel, merge_policy, false, false, false)
+    merge_index_with_policy(&indexrel, merge_policy, false, false, false)
 }
 
 pub unsafe fn merge_index_with_policy(
-    indexrel: PgRelation,
+    indexrel: &PgSearchRelation,
     mut merge_policy: LayeredMergePolicy,
     verbose: bool,
     gc_after_merge: bool,
     consider_create_index_segments: bool,
 ) -> (NumCandidates, NumMerged) {
-    let indexrelid = indexrel.oid();
-
     // take a shared lock on the CLEANUP_LOCK and hold it until this function is done.  We keep it
     // locked here so we can cause `ambulkdelete()` to block, waiting for all merging to finish
     // before it decides to find the segments it should vacuum.  The reason is that it needs to see
     // the final merged segment, not the original segments that will be deleted
-    let cleanup_lock = BufferManager::new(indexrelid).get_buffer(CLEANUP_LOCK);
-    let mut merge_lock = MergeLock::acquire(indexrelid);
-    let mut merger =
-        SearchIndexMerger::open(indexrelid).expect("should be able to open a SearchIndexMerger");
+    let cleanup_lock = BufferManager::new(indexrel).get_buffer(CLEANUP_LOCK);
+    let metadata = MetaPage::open(indexrel);
+    let merge_lock = metadata.acquire_merge_lock();
+    let directory = MvccSatisfies::Mergeable.directory(indexrel);
+    let merger =
+        SearchIndexMerger::open(directory).expect("should be able to open a SearchIndexMerger");
     let merger_segment_ids = merger
-        .segment_ids()
+        .searchable_segment_ids()
         .expect("SearchIndexMerger should have segment ids");
 
     // the non_mergeable_segments are those that are concurrently being vacuumed *and* merged
-    let mut non_mergeable_segments = merge_lock.list_vacuuming_segments();
-    non_mergeable_segments.extend(merge_lock.in_progress_segment_ids());
-    let create_index_segment_ids = merge_lock.create_index_segment_ids();
+    let mut non_mergeable_segments = metadata.vacuum_list().read_list();
+    non_mergeable_segments.extend(merge_lock.merge_list().list_segment_ids());
+    let create_index_segment_ids = metadata.create_index_segment_ids();
 
     if pg_sys::message_level_is_interesting(pg_sys::DEBUG1 as _) {
         pgrx::debug1!("do_merge: non_mergeable_segments={non_mergeable_segments:?}");
@@ -317,10 +301,12 @@ pub unsafe fn merge_index_with_policy(
     let ncandidates = merge_candidates.len();
     if ncandidates > 0 {
         // record all the segments the SearchIndexMerger can see, as those are the ones that
-        // could be merged.  This also drops the MergeLock
+        // could be merged
         let merge_entry = merge_lock
-            .record_in_progress_segment_ids(merge_policy.mergeable_segments())
+            .merge_list()
+            .add_segment_ids(merge_policy.mergeable_segments())
             .expect("should be able to write current merge segment_id list");
+        drop(merge_lock);
 
         // we are NOT under the MergeLock at this point, which allows concurrent backends to also merge
         //
@@ -337,7 +323,7 @@ pub unsafe fn merge_index_with_policy(
                     break;
                 }
                 if gc_after_merge {
-                    garbage_collect_index(&indexrel);
+                    garbage_collect_index(indexrel);
                     need_gc = false;
                 }
             }
@@ -381,29 +367,30 @@ pub unsafe fn merge_index_with_policy(
                 }
 
                 if gc_after_merge {
-                    garbage_collect_index(&indexrel);
+                    garbage_collect_index(indexrel);
                     need_gc = false;
                 }
             }
         }
 
         // re-acquire the MergeLock to remove the entry we made above
-        let mut merge_lock = MergeLock::acquire(indexrelid);
+        let merge_lock = metadata.acquire_merge_lock();
         merge_lock
+            .merge_list()
             .remove_entry(merge_entry)
             .expect("should be able to remove MergeEntry");
         drop(merge_lock);
 
         // we can garbage collect and return blocks back to the FSM without being under the MergeLock
         if need_gc {
-            garbage_collect_index(&indexrel);
+            garbage_collect_index(indexrel);
         }
 
         // if merging was cancelled due to a legit interrupt we'd prefer that be provided to the user
         check_for_interrupts!();
 
         if let Err(e) = merge_result {
-            panic!("failed to merge: {:?}", e);
+            panic!("failed to merge: {e:?}");
         }
     } else {
         drop(merge_lock);
@@ -421,9 +408,7 @@ pub unsafe fn merge_index_with_policy(
 /// moved to the `SEGMENT_METAS_GARBAGE` list until those replicas indicate that they are no longer
 /// in use, at which point they can be freed by `free_garbage`.
 ///
-unsafe fn garbage_collect_index(indexrel: &PgRelation) {
-    let indexrelid = indexrel.oid();
-
+pub unsafe fn garbage_collect_index(indexrel: &PgSearchRelation) {
     // Remove items which are no longer visible to active local transactions from SEGMENT_METAS,
     // and place them in SEGMENT_METAS_RECYLCABLE until they are no longer visible to remote
     // transactions either.
@@ -432,7 +417,7 @@ unsafe fn garbage_collect_index(indexrel: &PgRelation) {
     // SEGMENT_METAS_GARBAGE need not be because it is only ever consumed on the physical
     // replication primary.
     let mut segment_metas_linked_list =
-        LinkedItemList::<SegmentMetaEntry>::open(indexrelid, SEGMENT_METAS_START);
+        LinkedItemList::<SegmentMetaEntry>::open(indexrel, SEGMENT_METAS_START);
     let mut segment_metas = segment_metas_linked_list.atomically();
     let entries = segment_metas.garbage_collect();
 
@@ -442,11 +427,11 @@ unsafe fn garbage_collect_index(indexrel: &PgRelation) {
     free_entries(indexrel, entries);
 }
 
-pub fn free_entries(indexrel: &PgRelation, freeable_entries: Vec<SegmentMetaEntry>) {
+pub fn free_entries(indexrel: &PgSearchRelation, freeable_entries: Vec<SegmentMetaEntry>) {
     for entry in freeable_entries {
         for (file_entry, _) in entry.file_entries() {
             unsafe {
-                LinkedBytesList::open(indexrel.oid(), file_entry.starting_block).return_to_fsm();
+                LinkedBytesList::open(indexrel, file_entry.starting_block).return_to_fsm();
             }
         }
     }

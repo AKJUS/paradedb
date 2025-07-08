@@ -1,6 +1,6 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
+  "theme": "willow",
   "name": "ParadeDB",
   "colors": {
     "primary": "#4f46e5",
@@ -11,7 +11,7 @@
   "navigation": {
     "versions": [
       {
-        "version": "v0.15.19",
+        "version": "v0.16.3",
         "anchors": [
           {
             "anchor": "Documentation",
@@ -44,6 +44,7 @@
                               "documentation/configuration/overview",
                               "documentation/configuration/index",
                               "documentation/configuration/index_size",
+                              "documentation/configuration/segment_count",
                               "documentation/configuration/segment_size",
                               "documentation/configuration/write",
                               "documentation/configuration/parallel"
@@ -195,7 +196,8 @@
                     "group": "ParadeDB Self-Hosted",
                     "pages": [
                       "deploy/self-hosted/kubernetes",
-                      "deploy/self-hosted/extensions",
+                      "deploy/self-hosted/docker",
+                      "deploy/self-hosted/extension",
                       {
                         "group": "Logical Replication",
                         "pages": [
@@ -209,8 +211,7 @@
                           "deploy/self-hosted/high-availability/getting-started",
                           "deploy/self-hosted/high-availability/configuration"
                         ]
-                      },
-                      "deploy/self-hosted/docker"
+                      }
                     ]
                   },
                   "deploy/byoc",
@@ -236,8 +237,20 @@
               {
                 "group": "Changelog",
                 "pages": [
+                  "changelog/0.16.3",
+                  "changelog/0.16.2",
+                  "changelog/0.16.1",
+                  "changelog/0.16.0",
+                  "changelog/0.15.26",
+                  "changelog/0.15.25",
+                  "changelog/0.15.24",
+                  "changelog/0.15.23",
+                  "changelog/0.15.22",
+                  "changelog/0.15.21",
+                  "changelog/0.15.20",
                   "changelog/0.15.19",
                   "changelog/0.15.18",
+                  "changelog/0.15.17",
                   "changelog/0.15.16",
                   "changelog/0.15.15",
                   "changelog/0.15.14",

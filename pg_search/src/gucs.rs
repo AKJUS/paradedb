@@ -15,12 +15,42 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use crate::index::Parallelism;
-use pgrx::{pg_sys, GucContext, GucFlags, GucRegistry, GucSetting};
+use pgrx::pg_sys::panic::ErrorReport;
+use pgrx::{
+    function_name, pg_sys, GucContext, GucFlags, GucRegistry, GucSetting, PgLogLevel,
+    PgSqlErrorCode,
+};
+use std::ffi::CStr;
 use std::num::NonZeroUsize;
 
 /// Allows the user to toggle the use of our "ParadeDB Custom Scan".  The default is `true`.
 static ENABLE_CUSTOM_SCAN: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// Allows the user to toggle the use of the custom scan without use of the `@@@` operator. The
+/// default is `false`.
+static ENABLE_CUSTOM_SCAN_WITHOUT_OPERATOR: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+/// Allows the user to toggle the use of custom scan for queries that include non-indexed fields.
+/// When enabled, queries with non-indexed predicates will use HeapExpr for heap filtering.
+/// The default is `true`.
+static ENABLE_FILTER_PUSHDOWN: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// Allows the user to enable or disable the FastFieldsExecState executor. Default is `true`.
+static ENABLE_FAST_FIELD_EXEC: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// Allows the user to enable or disable the MixedFastFieldExecState executor. Default is `true`.
+static ENABLE_MIXED_FAST_FIELD_EXEC: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// The number of fast-field columns below-which the MixedFastFieldExecState will be used, rather
+/// than the NormalExecState. The Mixed execution mode fetches data as column-oriented, whereas
+/// the Normal mode fetches data as row-oriented.
+///
+/// Each fetch from a fast-field column costs one or two disk seeks, whereas a fetch of a row
+/// generally costs one. But with a wide enough row, fetching multiple columns might still result
+/// in better cache performance than fetching a row.
+static MIXED_FAST_FIELD_EXEC_COLUMN_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(3);
+static MIXED_FAST_FIELD_EXEC_COLUMN_THRESHOLD_NAME: &CStr =
+    c"paradedb.mixed_fast_field_exec_column_threshold";
 
 /// The `PER_TUPLE_COST` is an arbitrary value that needs to be really high.  In fact, we default
 /// to one hundred million.
@@ -37,102 +67,77 @@ static ENABLE_CUSTOM_SCAN: GucSetting<bool> = GucSetting::<bool>::new(true);
 /// it logically can.
 static PER_TUPLE_COST: GucSetting<f64> = GucSetting::<f64>::new(100_000_000.0);
 
-/// Should we log the progress of the CREATE INDEX operation?  Default is `false`.
-static LOG_CREATE_INDEX_PROGRESS: GucSetting<bool> = GucSetting::<bool>::new(false);
-
-/// How many threads should tantivy use during CREATE INDEX?
-static CREATE_INDEX_PARALLELISM: GucSetting<i32> = GucSetting::<i32>::new(0);
-
-/// How much memory should tantivy use during CREATE INDEX.  This value is decided to each indexing
-/// thread.  So if there's 10 threads and this value is 100MB, then a total of 1GB will be allocated.
-static CREATE_INDEX_MEMORY_BUDGET: GucSetting<i32> = GucSetting::<i32>::new(1024);
-
-/// How many threads should tantivy use during a regular INSERT/UPDATE/COPY statement?
-static STATEMENT_PARALLELISM: GucSetting<i32> = GucSetting::<i32>::new(1);
-
-/// How much memory should tantivy use during a regular INSERT/UPDATE/COPY statement?  This value is decided to each indexing
-/// thread.  So if there's 10 threads and this value is 100MB, then a total of 1GB will be allocated.
-static STATEMENT_MEMORY_BUDGET: GucSetting<i32> = GucSetting::<i32>::new(1024);
-
 pub fn init() {
     // Note that Postgres is very specific about the naming convention of variables.
     // They must be namespaced... we use 'paradedb.<variable>' below.
 
     GucRegistry::define_bool_guc(
-        "paradedb.enable_custom_scan",
-        "Enable ParadeDB's custom scan",
-        "Enable ParadeDB's custom scan",
+        c"paradedb.enable_custom_scan",
+        c"Enable ParadeDB's custom scan",
+        c"Enable ParadeDB's custom scan",
         &ENABLE_CUSTOM_SCAN,
         GucContext::Userset,
         GucFlags::default(),
     );
 
-    GucRegistry::define_float_guc(
-        "paradedb.per_tuple_cost",
-        "Arbitrary multiplier for the cost of retrieving a tuple from a USING bm25 index outside of an IndexScan",
-        "Default is 100,000,000.0.  It is very expensive to use a USING bm25 index in the wrong query plan",
-        &PER_TUPLE_COST,
-        0.0,
-        f64::MAX,
+    GucRegistry::define_bool_guc(
+        c"paradedb.enable_custom_scan_without_operator",
+        c"Enable ParadeDB's custom scan to run without the `@@@` operator",
+        c"Enable ParadeDB's custom scan to run even when the `@@@` operator has not been used in a query, as long as the entire WHERE clause is able to be pushed down",
+        &ENABLE_CUSTOM_SCAN_WITHOUT_OPERATOR,
         GucContext::Userset,
         GucFlags::default(),
     );
 
     GucRegistry::define_bool_guc(
-        "paradedb.log_create_index_progress",
-        "Log CREATE INDEX progress every 100,000 rows",
-        "",
-        &LOG_CREATE_INDEX_PROGRESS,
+        c"paradedb.enable_filter_pushdown",
+        c"Enable ParadeDB's custom scan for queries with non-indexed fields",
+        c"Enable ParadeDB's custom scan to handle queries that include non-indexed field predicates using HeapExpr for heap filtering. When disabled, such queries will fall back to standard PostgreSQL execution",
+        &ENABLE_FILTER_PUSHDOWN,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"paradedb.enable_fast_field_exec",
+        c"Enable StringFastFieldsExecState and NumericFastFieldsExecState executor",
+        c"Enable the StringFastFieldsExecState and NumericFastFieldsExecState executors for handling one string fast field or multiple numeric fast fields",
+        &ENABLE_FAST_FIELD_EXEC,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"paradedb.enable_mixed_fast_field_exec",
+        c"Enable MixedFastFieldExecState executor",
+        c"Enable the MixedFastFieldExecState executor for handling multiple string fast fields or mixed string/numeric fast fields",
+        &ENABLE_MIXED_FAST_FIELD_EXEC,
         GucContext::Userset,
         GucFlags::default(),
     );
 
     GucRegistry::define_int_guc(
-        "paradedb.create_index_parallelism",
-        "The number of threads to use when creating an index",
-        "Default is 0, which means a thread for as many cores in the machine",
-        &CREATE_INDEX_PARALLELISM,
-        0,
-        std::thread::available_parallelism()
-            .expect("your computer should have at least one core")
-            .get()
-            .try_into()
-            .expect("your computer has too many cores"),
-        GucContext::Userset,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_int_guc(
-        "paradedb.create_index_memory_budget",
-        "The amount of memory to allocate to 1 thread during indexing",
-        "Default is `1GB`, which is allocated to each thread defined by `paradedb.create_index_parallelism`",
-        &CREATE_INDEX_MEMORY_BUDGET,
+        MIXED_FAST_FIELD_EXEC_COLUMN_THRESHOLD_NAME,
+        c"Threshold of fetched columns below which MixedFastFieldExecState will be used.",
+        c"The number of fast-field columns below-which the MixedFastFieldExecState will be used, rather \
+         than the NormalExecState. The Mixed execution mode fetches data as column-oriented, whereas \
+         the Normal mode fetches data as row-oriented.",
+        &MIXED_FAST_FIELD_EXEC_COLUMN_THRESHOLD,
         0,
         i32::MAX,
         GucContext::Userset,
-        GucFlags::UNIT_MB,
-    );
-
-    GucRegistry::define_int_guc(
-        "paradedb.statement_parallelism",
-        "The number of threads to use when indexing during an INSERT/UPDATE/COPY statement",
-        "Default is 1.  Recommended value is generally 1.  Value of zero means a thread for as many cores in the machine",
-        &STATEMENT_PARALLELISM,
-        0,
-        std::thread::available_parallelism().expect("your computer should have at least one core").get().try_into().expect("your computer has too many cores"),
-        GucContext::Userset,
         GucFlags::default(),
     );
 
-    GucRegistry::define_int_guc(
-        "paradedb.statement_memory_budget",
-        "The amount of memory to allocate to 1 thread during an INSERT/UPDATE/COPY statement",
-        "Default is `1GB`, which is allocated to each thread defined by `paradedb.statement_parallelism`",
-        &STATEMENT_MEMORY_BUDGET,
-        0,
-        i32::MAX,
+    GucRegistry::define_float_guc(
+        c"paradedb.per_tuple_cost",
+        c"Arbitrary multiplier for the cost of retrieving a tuple from a USING bm25 index outside of an IndexScan",
+        c"Default is 100,000,000.0.  It is very expensive to use a USING bm25 index in the wrong query plan",
+        &PER_TUPLE_COST,
+        0.0,
+        f64::MAX,
         GucContext::Userset,
-        GucFlags::UNIT_MB,
+        GucFlags::default(),
     );
 }
 
@@ -140,74 +145,155 @@ pub fn enable_custom_scan() -> bool {
     ENABLE_CUSTOM_SCAN.get()
 }
 
+pub fn enable_custom_scan_without_operator() -> bool {
+    ENABLE_CUSTOM_SCAN_WITHOUT_OPERATOR.get()
+}
+
+pub fn enable_filter_pushdown() -> bool {
+    ENABLE_FILTER_PUSHDOWN.get()
+}
+
+pub fn is_fast_field_exec_enabled() -> bool {
+    ENABLE_FAST_FIELD_EXEC.get()
+}
+
+pub fn is_mixed_fast_field_exec_enabled() -> bool {
+    ENABLE_MIXED_FAST_FIELD_EXEC.get()
+}
+
+pub fn mixed_fast_field_exec_column_threshold() -> usize {
+    MIXED_FAST_FIELD_EXEC_COLUMN_THRESHOLD
+        .get()
+        .try_into()
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} must be positive. {e}",
+                MIXED_FAST_FIELD_EXEC_COLUMN_THRESHOLD_NAME
+                    .to_str()
+                    .unwrap()
+            );
+        })
+}
+
 pub fn per_tuple_cost() -> f64 {
     PER_TUPLE_COST.get()
 }
 
-pub fn log_create_index_progress() -> bool {
-    LOG_CREATE_INDEX_PROGRESS.get()
+// NB:  These limits come from [`tantivy::index_writer::MEMORY_BUDGET_NUM_BYTES_MAX`], which is not publicly exposed
+mod limits {
+    const MARGIN_IN_BYTES: usize = 1_000_000;
+    // Size of the margin for the `memory_arena`. A segment is closed when the remaining memory
+    // in the `memory_arena` goes below MARGIN_IN_BYTES.
+    pub const MEMORY_BUDGET_NUM_BYTES_MIN: usize = 15 * MARGIN_IN_BYTES;
+
+    // We impose the memory per thread to be no greater than 4GB as that's tantivy's limit
+    pub const MEMORY_BUDGET_NUM_BYTES_MAX: usize = (4 * 1024 * 1024 * 1024) - MARGIN_IN_BYTES;
 }
 
-pub fn create_index_parallelism() -> NonZeroUsize {
-    adjust_nthreads(CREATE_INDEX_PARALLELISM.get())
-}
+pub fn adjust_maintenance_work_mem(nlaunched: usize) -> NonZeroUsize {
+    let nlaunched = nlaunched.max(1);
+    let mwm_as_bytes = unsafe { pg_sys::maintenance_work_mem as usize } * 1024;
+    let per_worker_budget = mwm_as_bytes / nlaunched;
 
-pub fn create_index_memory_budget() -> usize {
-    adjust_budget(CREATE_INDEX_MEMORY_BUDGET.get(), create_index_parallelism())
-}
-
-pub fn statement_parallelism() -> NonZeroUsize {
-    adjust_nthreads(STATEMENT_PARALLELISM.get())
-}
-
-pub fn statement_memory_budget() -> usize {
-    adjust_budget(STATEMENT_MEMORY_BUDGET.get(), statement_parallelism())
-}
-
-fn adjust_nthreads(nthreads: i32) -> NonZeroUsize {
-    let nthreads = if nthreads <= 0 {
-        std::thread::available_parallelism()
-            .expect("your computer should have at least one core")
-            .get()
+    if per_worker_budget < limits::MEMORY_BUDGET_NUM_BYTES_MIN {
+        ErrorReport::new(
+            PgSqlErrorCode::ERRCODE_INSUFFICIENT_RESOURCES,
+            "`maintenance_work_mem` is not high enough to give each parallel worker 15MB",
+            function_name!(),
+        )
+        .set_detail(format!("this query asked for {nlaunched} workers, so `maintenance_work_mem` must be at least {nlaunched} * 15MB"))
+        .set_hint("`SET maintenance_work_mem = <number>`")
+        .report(PgLogLevel::ERROR);
     } else {
-        nthreads as usize
-    };
-
-    unsafe {
-        // SAFETY:  we ensured above that nthreads is > 0
-        NonZeroUsize::new_unchecked(nthreads)
+        pgrx::debug1!(
+            "adjust_maintenance_work_mem: per_worker_budget: {per_worker_budget}, minimum: {}",
+            limits::MEMORY_BUDGET_NUM_BYTES_MIN
+        );
     }
-}
-
-fn adjust_budget(per_thread_budget: i32, parallelism: Parallelism) -> usize {
-    // NB:  These limits come from [`tantivy::index_writer::MEMORY_BUDGET_NUM_BYTES_MAX`], which is not publicly exposed
-    mod limits {
-        // Size of the margin for the `memory_arena`. A segment is closed when the remaining memory
-        // in the `memory_arena` goes below MARGIN_IN_BYTES.
-        pub const MARGIN_IN_BYTES: usize = 1_000_000;
-
-        // We impose the memory per thread to be at least 15 MB, as the baseline consumption is 12MB.
-        pub const MEMORY_BUDGET_NUM_BYTES_MIN: usize = ((MARGIN_IN_BYTES as u32) * 15u32) as usize;
-        pub const MEMORY_BUDGET_NUM_BYTES_MAX: usize = u32::MAX as usize - MARGIN_IN_BYTES;
-    }
-
-    let per_thread_budget = if per_thread_budget <= 0 {
-        // value is unset, so we'll use the maintenance_work_mem, divided between the parallelism value
-        let mwm_as_bytes = unsafe {
-            // SAFETY:  Postgres sets maintenance_work_mem when it starts up
-            pg_sys::maintenance_work_mem as usize * 1024 // convert from kilobytes to bytes
-        };
-
-        mwm_as_bytes / parallelism.get()
-    } else {
-        per_thread_budget as usize * 1024 * 1024 // convert from megabytes to bytes
-    };
 
     // clamp the per_thread_budget to the min/max values
-    let per_thread_budget = per_thread_budget.clamp(
+    let per_worker_budget = per_worker_budget.clamp(
         limits::MEMORY_BUDGET_NUM_BYTES_MIN,
         limits::MEMORY_BUDGET_NUM_BYTES_MAX - 1,
     );
 
-    per_thread_budget * parallelism.get()
+    NonZeroUsize::new(per_worker_budget * nlaunched).unwrap()
+}
+
+pub fn adjust_work_mem() -> NonZeroUsize {
+    let wm_as_bytes = unsafe { pg_sys::work_mem as usize * 1024 };
+    let wm_as_bytes = wm_as_bytes.clamp(
+        limits::MEMORY_BUDGET_NUM_BYTES_MIN,
+        limits::MEMORY_BUDGET_NUM_BYTES_MAX - 1,
+    );
+
+    NonZeroUsize::new(wm_as_bytes).unwrap()
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use super::*;
+    use pgrx::prelude::*;
+
+    macro_rules! assert_approx_eq {
+        ($a:expr, $b:expr, $percent:expr) => {{
+            let a = $a;
+            let b = $b;
+            let diff = if a > b { a - b } else { b - a };
+            let max_val = a.max(b);
+            let max_diff = ((max_val as f64) * ($percent as f64 / 100.0)).ceil() as usize;
+
+            assert!(
+                diff <= max_diff,
+                "assertion failed: `a = {}`, `b = {}` differ by more than {}% (allowed: {}, actual: {})",
+                a,
+                b,
+                $percent,
+                max_diff,
+                diff
+            );
+        }};
+    }
+
+    #[pg_test]
+    fn test_adjust_work_mem() {
+        Spi::run("SET work_mem = '4MB';").unwrap();
+        assert_approx_eq!(adjust_work_mem().get(), 15 * 1_000_000, 1.0);
+
+        Spi::run("SET work_mem = '1GB';").unwrap();
+        assert_approx_eq!(adjust_work_mem().get(), 1024 * 1024 * 1024, 1.0);
+    }
+
+    #[pg_test]
+    fn test_adjust_maintenance_work_mem() {
+        Spi::run("SET maintenance_work_mem = '16MB';").unwrap();
+        assert_approx_eq!(adjust_maintenance_work_mem(0).get(), 16 * 1024 * 1024, 1.0);
+        assert_approx_eq!(adjust_maintenance_work_mem(1).get(), 16 * 1024 * 1024, 1.0);
+        assert!(std::panic::catch_unwind(|| adjust_maintenance_work_mem(2)).is_err());
+        assert!(std::panic::catch_unwind(|| adjust_maintenance_work_mem(10)).is_err());
+
+        Spi::run("SET maintenance_work_mem = '1GB';").unwrap();
+        assert_approx_eq!(
+            adjust_maintenance_work_mem(0).get(),
+            1024 * 1024 * 1024,
+            1.0
+        );
+        assert_approx_eq!(
+            adjust_maintenance_work_mem(1).get(),
+            1024 * 1024 * 1024,
+            1.0
+        );
+        assert_approx_eq!(
+            adjust_maintenance_work_mem(2).get(),
+            1024 * 1024 * 1024,
+            1.0
+        );
+        assert_approx_eq!(
+            adjust_maintenance_work_mem(10).get(),
+            1024 * 1024 * 1024,
+            1.0
+        );
+        assert!(std::panic::catch_unwind(|| adjust_maintenance_work_mem(128)).is_err());
+    }
 }

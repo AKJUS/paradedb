@@ -21,10 +21,16 @@ use super::storage::block::CLEANUP_LOCK;
 use crate::index::fast_fields_helper::FFType;
 use crate::index::mvcc::MvccSatisfies;
 use crate::index::reader::index::SearchIndexReader;
-use crate::index::writer::index::SearchIndexWriter;
-use crate::index::WriterResources;
 use crate::postgres::storage::buffer::BufferManager;
-use crate::postgres::storage::merge::MergeLock;
+use crate::postgres::storage::metadata::MetaPage;
+
+use crate::postgres::rel::PgSearchRelation;
+use anyhow::Result;
+use pgrx::pg_sys;
+use tantivy::index::SegmentId;
+use tantivy::indexer::delete_queue::DeleteQueue;
+use tantivy::indexer::{advance_deletes, DeleteOperation, SegmentEntry};
+use tantivy::{Directory, DocId, Index, IndexMeta, Opstamp};
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn ambulkdelete(
@@ -35,7 +41,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
 ) -> *mut pg_sys::IndexBulkDeleteResult {
     let info = PgBox::from_pg(info);
     let mut stats = PgBox::<pg_sys::IndexBulkDeleteResult>::from_pg(stats.cast());
-    let index_relation = PgRelation::from_pg(info.index);
+    let index_relation = PgSearchRelation::from_pg(info.index);
     let callback =
         callback.expect("the ambulkdelete() callback should be a valid function pointer");
     let callback = move |ctid_val: u64| {
@@ -46,49 +52,40 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
 
     // first, we need an exclusive lock on the CLEANUP_LOCK.  Once we get it, we know that there
     // are no concurrent merges happening
-    let cleanup_lock = BufferManager::new(index_relation.oid()).get_buffer_mut(CLEANUP_LOCK);
+    let cleanup_lock = BufferManager::new(&index_relation).get_buffer_mut(CLEANUP_LOCK);
+    let mut metadata = MetaPage::open(&index_relation);
 
     // take the MergeLock
-    let merge_lock = {
-        // this should acquire instantly as at this point, because of our exclusive lock on CLEANUP_LOCK
-        // we know there's nobody else that might also be holding the merge lock
-        let mut merge_lock = MergeLock::acquire(index_relation.oid());
+    let merge_lock = metadata.acquire_merge_lock();
 
-        // garbage collecting the MergeLock is necessary to remove any stale entries that may have
-        // been leftover from a cancelled merge or crash during merge
-        merge_lock.garbage_collect();
-        pg_sys::IndexFreeSpaceMapVacuum(index_relation.as_ptr());
+    // garbage collecting the MergeList is necessary to remove any stale entries that may have
+    // been leftover from a cancelled merge or crash during merge
+    merge_lock.merge_list().garbage_collect();
+    pg_sys::IndexFreeSpaceMapVacuum(index_relation.as_ptr());
 
-        // and now we should not have any merges happening, and cannot
-        assert!(
-            !merge_lock.is_merge_in_progress(),
-            "ambulkdelete cannot run concurrently with an active merge operation"
-        );
-        merge_lock
-    };
+    // and now we should not have any merges happening, and cannot
+    assert!(
+        merge_lock.merge_list().is_empty(),
+        "ambulkdelete cannot run concurrently with an active merge operation"
+    );
     drop(cleanup_lock);
 
-    let mut index_writer = SearchIndexWriter::open(
-        &index_relation,
-        MvccSatisfies::Vacuum,
-        WriterResources::Vacuum,
-    )
-    .expect("ambulkdelete: should be able to open a SearchIndexWriter");
-    let reader = SearchIndexReader::open(&index_relation, MvccSatisfies::Vacuum)
+    let reader = SearchIndexReader::empty(&index_relation, MvccSatisfies::Vacuum)
         .expect("ambulkdelete: should be able to open a SearchIndexReader");
+    let writer_segment_ids = reader.segment_ids();
 
-    let writer_segment_ids = index_writer.segment_ids();
-
-    // write out the list of segment ids we're about to operate on.  Doing so drops the MergeLock
-    // and returns the `vacuum_sentinel`.  The segment ids written here will be excluded from possible
-    // future concurrent merges, until `vacuum_sentinel` is dropped
-    let vacuum_sentinel = merge_lock
-        .vacuum_list()
-        .write_list(writer_segment_ids.iter());
+    // Write out the list of segment ids we're about to operate on
+    // Then acquire a `vacuum_sentinel` to notify concurrent backends that a vacuum is happening
+    // The segment ids written here will be excluded from possible future concurrent merges, until `vacuum_sentinel` is dropped
+    metadata.vacuum_list().write_list(writer_segment_ids.iter());
+    let vacuum_sentinel = metadata.pin_ambulkdelete_sentinel();
+    // It's important to drop the merge lock after the `vacuum_sentinel` is pinned
+    drop(merge_lock);
 
     let mut did_delete = false;
     for segment_reader in reader.segment_readers() {
-        if !writer_segment_ids.contains(&segment_reader.segment_id()) {
+        let segment_id = segment_reader.segment_id();
+        if !writer_segment_ids.contains(&segment_id) {
             // the writer doesn't have this segment reader, and that's fine
             // we open the writer and reader in separate calls so it's possible
             // for the reader, which is opened second and outside of the MergeLock,
@@ -96,7 +93,10 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
             // need to concern ourselves with the ones the writer is aware of
             continue;
         }
+        let mut deleter = SegmentDeleter::open(&index_relation, segment_id)
+            .expect("ambulkdelete: should be able to open a SegmentDeleter");
         let ctid_ff = FFType::new_ctid(segment_reader.fast_fields());
+        let mut needs_commit = false;
 
         for doc_id in 0..segment_reader.max_doc() {
             if doc_id % 100 == 0 {
@@ -107,20 +107,20 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
             let ctid = ctid_ff.as_u64(doc_id).expect("ctid should be present");
             if callback(ctid) {
                 did_delete = true;
-                index_writer
-                    .delete_document(segment_reader.segment_id(), doc_id)
-                    .expect("ambulkdelete: deleting document by segment and id should succeed");
+                needs_commit = true;
+                deleter.delete_document(doc_id);
             }
+        }
+
+        if needs_commit {
+            deleter
+                .commit()
+                .expect("ambulkdelete: segment deletercommit should succeed");
         }
     }
     // no need to keep the reader around.  Also, it holds a pin on the CLEANUP_LOCK, which
     // will get in the way of our CLEANUP_LOCK barrier below
     drop(reader);
-
-    // this won't merge as the `WriterResources::Vacuum` uses `AllowedMergePolicy::None`
-    index_writer
-        .commit()
-        .expect("ambulkdelete: commit should succeed");
 
     if stats.is_null() {
         stats = unsafe {
@@ -140,10 +140,80 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     // Effectively, we're blocking ambulkdelete from finishing until we know that concurrent
     // scans have finished too
     if did_delete {
-        drop(BufferManager::new(index_relation.oid()).get_buffer_for_cleanup(CLEANUP_LOCK));
+        drop(BufferManager::new(&index_relation).get_buffer_for_cleanup(CLEANUP_LOCK));
     }
 
     // we're done, no need to hold onto the sentinel any longer
     drop(vacuum_sentinel);
     stats.into_pg()
+}
+
+struct SegmentDeleter {
+    delete_queue: DeleteQueue,
+    segment_entry: SegmentEntry,
+    index: Index,
+    opstamp: Opstamp,
+}
+
+impl SegmentDeleter {
+    pub fn open(index_relation: &PgSearchRelation, segment_id: SegmentId) -> Result<Self> {
+        let delete_queue = DeleteQueue::new();
+        let delete_cursor = delete_queue.cursor();
+
+        let directory = MvccSatisfies::Vacuum.directory(index_relation);
+        let index = Index::open(directory)?;
+        let searchable_segment_metas = index.searchable_segment_metas()?;
+        let segment_meta = searchable_segment_metas
+            .iter()
+            .find(|meta| meta.id() == segment_id)
+            .unwrap_or_else(|| panic!("segment meta not found for segment_id: {segment_id:?}"));
+        let opstamp = segment_meta.delete_opstamp().unwrap_or_default();
+
+        // It's important to set the entry/cursor at the beginning vs. when commit() is called,
+        // because the delete cursor can only look forward
+        let segment_entry = SegmentEntry::new(segment_meta.clone(), delete_cursor, None);
+
+        Ok(Self {
+            delete_queue,
+            segment_entry,
+            index,
+            opstamp,
+        })
+    }
+
+    pub fn delete_document(&mut self, doc_id: DocId) {
+        self.opstamp += 1;
+        self.delete_queue.push(DeleteOperation::ByAddress {
+            opstamp: self.opstamp,
+            segment_id: self.segment_entry.meta().id(),
+            doc_id,
+        });
+    }
+
+    pub fn commit(mut self) -> Result<()> {
+        let segment = self.index.segment(self.segment_entry.meta().clone());
+        advance_deletes(segment, &mut self.segment_entry, self.opstamp + 1)?;
+
+        let current_metas = self.index.load_metas()?;
+        let modified_segments = current_metas
+            .segments
+            .clone()
+            .into_iter()
+            .map(|meta| {
+                if meta.id() == self.segment_entry.meta().id() {
+                    self.segment_entry.meta().clone()
+                } else {
+                    meta
+                }
+            })
+            .collect();
+        let new_metas = IndexMeta {
+            segments: modified_segments,
+            ..current_metas.clone()
+        };
+        self.index
+            .directory()
+            .save_metas(&new_metas, &current_metas, &mut ())?;
+        Ok(())
+    }
 }

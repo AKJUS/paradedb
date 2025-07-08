@@ -15,13 +15,15 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+use crate::api::FieldName;
 use crate::api::{AsCStr, Cardinality, Varno};
-use crate::postgres::customscan::builders::custom_path::OrderByStyle;
-use crate::postgres::customscan::builders::custom_path::SortDirection;
+use crate::api::{HashMap, HashSet};
+use crate::index::fast_fields_helper::WhichFastField;
+use crate::postgres::customscan::builders::custom_path::{OrderByStyle, SortDirection};
+use crate::postgres::customscan::pdbscan::ExecMethodType;
 use crate::query::SearchQueryInput;
 use pgrx::pg_sys::AsPgCStr;
 use pgrx::{pg_sys, PgList};
-use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Default, Debug, Serialize, Deserialize)]
@@ -31,12 +33,23 @@ pub struct PrivateData {
     range_table_index: Option<pg_sys::Index>,
     query: Option<SearchQueryInput>,
     limit: Option<usize>,
-    sort_field: Option<String>,
+    sort_field: Option<FieldName>,
     sort_direction: Option<SortDirection>,
     #[serde(with = "var_attname_lookup_serializer")]
-    var_attname_lookup: Option<FxHashMap<(Varno, pg_sys::AttrNumber), String>>,
-    maybe_ff: bool,
+    var_attname_lookup: Option<HashMap<(Varno, pg_sys::AttrNumber), FieldName>>,
     segment_count: usize,
+    // The fast fields which were identified during planning time as potentially being
+    // needed at execution time. In order for our planning-time-chosen ExecMethodType to be
+    // accurate, this must always be a superset of the fields extracted from the execution
+    // time target list.
+    planned_which_fast_fields: Option<HashSet<WhichFastField>>,
+    target_list_len: Option<usize>,
+    referenced_columns_count: usize,
+    need_scores: bool,
+    exec_method_type: ExecMethodType,
+    // Additional search predicates from join filters that are relevant for snippet/score generation
+    // Stores the entire simplified Boolean expression to preserve OR structures like (TRUE OR name:"Rowling")
+    join_predicates: Option<SearchQueryInput>,
 }
 
 mod var_attname_lookup_serializer {
@@ -59,16 +72,16 @@ mod var_attname_lookup_serializer {
 
         let p1 = p1_str
             .parse::<Varno>()
-            .map_err(|e| format!("Failed to parse first key part '{}': {}", p1_str, e))?;
+            .map_err(|e| format!("Failed to parse first key part '{p1_str}': {e}"))?;
         let p2 = p2_str
             .parse::<i16>()
-            .map_err(|e| format!("Failed to parse second key part '{}': {}", p2_str, e))?;
+            .map_err(|e| format!("Failed to parse second key part '{p2_str}': {e}"))?;
 
         Ok((p1, p2))
     }
 
     pub fn serialize<S>(
-        map_option: &Option<FxHashMap<(Varno, i16), String>>,
+        map_option: &Option<HashMap<(Varno, i16), FieldName>>,
         serializer: S,
     ) -> Result<S::Ok, S::Error>
     where
@@ -81,28 +94,29 @@ mod var_attname_lookup_serializer {
         // Serialize as Vec<(String, String)>.
         map.iter()
             .map(|(k, v)| (key_to_string(k), v))
-            .collect::<Vec<(String, &String)>>()
+            .collect::<Vec<(String, &FieldName)>>()
             .serialize(serializer)
     }
 
     #[allow(clippy::type_complexity)]
     pub fn deserialize<'de, D>(
         deserializer: D,
-    ) -> Result<Option<FxHashMap<(Varno, i16), String>>, D::Error>
+    ) -> Result<Option<HashMap<(Varno, i16), FieldName>>, D::Error>
     where
         D: Deserializer<'de>,
     {
         // Deserialize as Vec<(String, String)>.
-        let Some(string_map) = Option::<Vec<(&'de str, String)>>::deserialize(deserializer)? else {
+        let Some(string_map) = Option::<Vec<(&'de str, FieldName)>>::deserialize(deserializer)?
+        else {
             return Ok(None);
         };
 
-        let mut map = FxHashMap::default();
+        let mut map = HashMap::default();
         map.reserve(string_map.len());
 
         for (k_str, v) in string_map {
             let key_tuple = key_from_string(k_str)
-                .map_err(|e| D::Error::custom(format!("Invalid key format '{}': {}", k_str, e)))?;
+                .map_err(|e| D::Error::custom(format!("Invalid key format '{k_str}': {e}")))?;
             map.insert(key_tuple, v);
         }
         Ok(Some(map))
@@ -174,17 +188,40 @@ impl PrivateData {
 
     pub fn set_var_attname_lookup(
         &mut self,
-        var_attname_lookup: FxHashMap<(Varno, pg_sys::AttrNumber), String>,
+        var_attname_lookup: HashMap<(Varno, pg_sys::AttrNumber), FieldName>,
     ) {
         self.var_attname_lookup = Some(var_attname_lookup);
     }
 
-    pub fn set_maybe_ff(&mut self, maybe: bool) {
-        self.maybe_ff = maybe;
-    }
-
     pub fn set_segment_count(&mut self, segment_count: usize) {
         self.segment_count = segment_count;
+    }
+
+    pub fn set_planned_which_fast_fields(
+        &mut self,
+        planned_which_fast_fields: HashSet<WhichFastField>,
+    ) {
+        self.planned_which_fast_fields = Some(planned_which_fast_fields);
+    }
+
+    pub fn set_exec_method_type(&mut self, exec_method_type: ExecMethodType) {
+        self.exec_method_type = exec_method_type;
+    }
+
+    pub fn set_target_list_len(&mut self, len: Option<usize>) {
+        self.target_list_len = len;
+    }
+
+    pub fn set_referenced_columns_count(&mut self, count: usize) {
+        self.referenced_columns_count = count;
+    }
+
+    pub fn set_need_scores(&mut self, maybe: bool) {
+        self.need_scores = maybe;
+    }
+
+    pub fn set_join_predicates(&mut self, predicates: Option<SearchQueryInput>) {
+        self.join_predicates = predicates;
     }
 }
 
@@ -213,7 +250,7 @@ impl PrivateData {
         self.limit
     }
 
-    pub fn sort_field(&self) -> Option<String> {
+    pub fn sort_field(&self) -> Option<FieldName> {
         self.sort_field.clone()
     }
 
@@ -228,15 +265,37 @@ impl PrivateData {
         )
     }
 
-    pub fn var_attname_lookup(&self) -> &Option<FxHashMap<(Varno, pg_sys::AttrNumber), String>> {
+    pub fn var_attname_lookup(&self) -> &Option<HashMap<(Varno, pg_sys::AttrNumber), FieldName>> {
         &self.var_attname_lookup
     }
 
     pub fn maybe_ff(&self) -> bool {
-        self.maybe_ff
+        // If we have planned fast fields, then maybe we can use them!
+        !self.planned_which_fast_fields.as_ref().unwrap().is_empty()
     }
 
     pub fn segment_count(&self) -> usize {
         self.segment_count
+    }
+
+    pub fn planned_which_fast_fields(&self) -> &Option<HashSet<WhichFastField>> {
+        &self.planned_which_fast_fields
+    }
+
+    pub fn exec_method_type(&self) -> &ExecMethodType {
+        &self.exec_method_type
+    }
+
+    pub fn referenced_columns_count(&self) -> usize {
+        debug_assert!(self.referenced_columns_count >= self.target_list_len.unwrap_or(0));
+        self.referenced_columns_count
+    }
+
+    pub fn need_scores(&self) -> bool {
+        self.need_scores
+    }
+
+    pub fn join_predicates(&self) -> &Option<SearchQueryInput> {
+        &self.join_predicates
     }
 }

@@ -1,12 +1,29 @@
+// Copyright (c) 2023-2025 ParadeDB, Inc.
+//
+// This file is part of ParadeDB - Postgres for Search and Analytics
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+use std::os::raw::c_void;
+
 use crate::api::Cardinality;
+use crate::api::HashSet;
 use crate::postgres::customscan::builders::custom_state::CustomScanStateWrapper;
 use crate::postgres::customscan::dsm::ParallelQueryCapable;
 use crate::postgres::customscan::pdbscan::PdbScan;
-use crate::postgres::customscan::CustomScan;
 use crate::postgres::ParallelScanState;
 use pgrx::pg_sys::{self, shm_toc, ParallelContext, Size};
-use std::collections::HashSet;
-use std::os::raw::c_void;
 use tantivy::index::SegmentId;
 
 impl ParallelQueryCapable for PdbScan {
@@ -15,22 +32,11 @@ impl ParallelQueryCapable for PdbScan {
         pcxt: *mut ParallelContext,
     ) -> Size {
         if state.custom_state().search_reader.is_none() {
-            PdbScan::rescan_custom_scan(state);
+            PdbScan::init_search_reader(state);
         }
 
-        let serialized_query = serde_json::to_vec(&state.custom_state().search_query_input)
-            .expect("should be able to serialize query");
-        state.custom_state_mut().serialized_query = serialized_query;
-
-        let segment_count = state
-            .custom_state()
-            .search_reader
-            .as_ref()
-            .expect("search reader must be initialized to estimate DSM size")
-            .segment_readers()
-            .len();
-
-        ParallelScanState::size_of(segment_count, &state.custom_state_mut().serialized_query)
+        let (segments, serialized_query) = state.custom_state().parallel_serialization_data();
+        ParallelScanState::size_of(segments.len(), &serialized_query)
     }
 
     fn initialize_dsm_custom_scan(
@@ -38,18 +44,12 @@ impl ParallelQueryCapable for PdbScan {
         pcxt: *mut ParallelContext,
         coordinate: *mut c_void,
     ) {
-        let pscan_state = coordinate.cast::<ParallelScanState>();
-        assert!(!pscan_state.is_null(), "coordinate is null");
+        let (segments, serialized_query) = state.custom_state().parallel_serialization_data();
 
         unsafe {
-            let segments = state
-                .custom_state()
-                .search_reader
-                .as_ref()
-                .expect("search_reader must be initialized to initialize DSM")
-                .segment_readers();
-            (*pscan_state).init(segments, &state.custom_state().serialized_query);
-
+            let pscan_state = coordinate.cast::<ParallelScanState>();
+            assert!(!pscan_state.is_null(), "coordinate is null");
+            (*pscan_state).init(segments, &serialized_query);
             state.custom_state_mut().parallel_state = Some(pscan_state);
         }
     }
@@ -77,7 +77,7 @@ impl ParallelQueryCapable for PdbScan {
                 .query()
                 .expect("should be able to serialize the query from the ParallelScanState")
             {
-                Some(query) => state.custom_state_mut().search_query_input = query,
+                Some(query) => state.custom_state_mut().set_base_search_query_input(query),
                 None => panic!("no query in ParallelScanState"),
             }
         }
@@ -90,7 +90,12 @@ impl ParallelQueryCapable for PdbScan {
 ///
 pub fn compute_nworkers(limit: Option<Cardinality>, segment_count: usize, sorted: bool) -> usize {
     // we will try to parallelize based on the number of index segments
-    let mut nworkers = unsafe { segment_count.min(pg_sys::max_parallel_workers as usize) };
+    // parallel workers available to a gather node are limited by max_parallel_workers_per_gather and max_parallel_workers
+    let mut nworkers = unsafe {
+        segment_count
+            .min(pg_sys::max_parallel_workers_per_gather as usize)
+            .min(pg_sys::max_parallel_workers as usize)
+    };
 
     if let Some(limit) = limit {
         if !sorted && limit <= (segment_count * segment_count * segment_count) as Cardinality {
@@ -100,7 +105,7 @@ pub fn compute_nworkers(limit: Option<Cardinality>, segment_count: usize, sorted
 
         // if the limit is less than some arbitrarily large value
         // use at most half the number of parallel workers as there are segments
-        // this generally seems to perform better than directly using `max_parallel_workers`
+        // this generally seems to perform better than directly using `max_parallel_workers_per_gather`
         if limit < 1_000_000.0 {
             nworkers = (segment_count / 2).min(nworkers);
         }
@@ -118,12 +123,38 @@ pub fn compute_nworkers(limit: Option<Cardinality>, segment_count: usize, sorted
 }
 
 pub unsafe fn checkout_segment(pscan_state: *mut ParallelScanState) -> Option<SegmentId> {
-    let mutex = (*pscan_state).acquire_mutex();
-    if (*pscan_state).remaining_segments() > 0 {
-        let remaining_segments = (*pscan_state).decrement_remaining_segments();
-        Some((*pscan_state).segment_id(remaining_segments))
-    } else {
-        None
+    #[cfg(not(any(feature = "pg14", feature = "pg15")))]
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+
+    loop {
+        let mutex = (*pscan_state).acquire_mutex();
+        let remaining_segments = (*pscan_state).remaining_segments();
+        if remaining_segments == 0 {
+            break None;
+        }
+
+        // If debug_parallel_query is enabled and we're the leader, then do not take the first
+        // segment (unless a deadline has passed, since in some cases we may not have any workers:
+        // e.g. UNIONS under a Gather node, etc).
+        //
+        // This significantly improves the reproducibility of parallel worker issues with small
+        // datasets, since it means that unlike in the non-parallel case, the leader will be
+        // unlikely to emit all of the segments before the workers have had a chance to start up.
+        #[cfg(not(any(feature = "pg14", feature = "pg15")))]
+        if pg_sys::debug_parallel_query != 0
+            && pg_sys::ParallelWorkerNumber == -1
+            && remaining_segments == (*pscan_state).nsegments()
+            && std::time::Instant::now() < deadline
+        {
+            continue;
+        }
+
+        // segments are claimed back-to-front and they were already organized smallest-to-largest
+        // by num_docs over in [`ParallelScanPayload::init()`].
+        //
+        // this means we're purposely checking out documents from largest-to-smallest.
+        let claimed_segment = (*pscan_state).decrement_remaining_segments();
+        break Some((*pscan_state).segment_id(claimed_segment));
     }
 }
 

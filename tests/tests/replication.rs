@@ -105,14 +105,14 @@ impl EphemeralPostgres {
         // Write to postgresql.conf
         let config_content = match postgresql_conf {
             Some(config) => format!("port = {}\n{}", port, config.trim()),
-            None => format!("port = {}", port),
+            None => format!("port = {port}"),
         };
-        let config_path = format!("{}/postgresql.conf", tempdir_path);
+        let config_path = format!("{tempdir_path}/postgresql.conf");
         std::fs::write(config_path, config_content).expect("Failed to write to postgresql.conf");
 
         // Write to pg_hba.conf
         if let Some(config_content) = pg_hba_conf {
-            let config_path = format!("{}/pg_hba.conf", tempdir_path);
+            let config_path = format!("{tempdir_path}/pg_hba.conf");
 
             let mut file = std::fs::OpenOptions::new()
                 .append(true)
@@ -120,12 +120,12 @@ impl EphemeralPostgres {
                 .open(config_path)
                 .expect("Failed to open pg_hba.conf");
 
-            writeln!(file, "{}", config_content).expect("Failed to append to pg_hba.conf");
+            writeln!(file, "{config_content}").expect("Failed to append to pg_hba.conf");
         }
 
         // Create log directory
         let timestamp = chrono::Utc::now().timestamp_millis();
-        let logfile = format!("/tmp/ephemeral_postgres_logs/{}.log", timestamp);
+        let logfile = format!("/tmp/ephemeral_postgres_logs/{timestamp}.log");
         std::fs::create_dir_all(Path::new(&logfile).parent().unwrap())
             .expect("Failed to create log directory");
 
@@ -150,7 +150,7 @@ impl EphemeralPostgres {
 
         let init_db_path = Self::initdb_path();
         let tempdir = TempDir::new().expect("Failed to create temp dir");
-        let tempdir_path = tempdir.into_path();
+        let tempdir_path = tempdir.keep();
 
         // Initialize PostgreSQL data directory
         run_cmd!($init_db_path -D $tempdir_path &> /dev/null)
@@ -225,7 +225,7 @@ async fn test_ephemeral_postgres_with_pg_basebackup() -> Result<()> {
     assert_eq!(source_results.len(), 1);
 
     let target_tempdir = TempDir::new().expect("Failed to create temp dir");
-    let target_tempdir_path = target_tempdir.into_path();
+    let target_tempdir_path = target_tempdir.keep();
 
     // Permissions for the --pgdata directory passed to pg_basebackup
     // should be u=rwx (0700) or u=rwx,g=rx (0750)

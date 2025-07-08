@@ -27,7 +27,7 @@ use serde_json::Value;
 use sqlx::PgConnection;
 
 fn fmt_err<T: std::error::Error>(err: T) -> String {
-    format!("unexpected error, received: {}", err)
+    format!("unexpected error, received: {err}")
 }
 
 #[rstest]
@@ -42,7 +42,7 @@ fn invalid_create_index(mut conn: PgConnection) {
         Ok(_) => panic!("should fail with no key_field"),
         Err(err) => assert_eq!(
             err.to_string(),
-            "error returned from database: key_field WITH option should be configured"
+            "error returned from database: index should have a `WITH (key_field='...')` option"
         ),
     };
 }
@@ -396,7 +396,7 @@ fn null_key_field_build(mut conn: PgConnection) {
         Ok(_) => panic!("should fail with null key_field"),
         Err(err) => assert_eq!(
             err.to_string(),
-            "error returned from database: error creating index entries for index 'index_config_index': key_field column 'id' cannot be NULL"
+            "error returned from database: key_field column 'id' cannot be NULL"
         ),
     };
 }
@@ -416,7 +416,7 @@ fn null_key_field_insert(mut conn: PgConnection) {
         Ok(_) => panic!("should fail with null key_field"),
         Err(err) => assert_eq!(
             err.to_string(),
-            "error returned from database: error creating index entries for index 'index_config_index': key_field column 'id' cannot be NULL"
+            "error returned from database: key_field column 'id' cannot be NULL"
         ),
     };
 }
@@ -1010,7 +1010,8 @@ fn non_partitioned_no_order_by_limit_pushdown(mut conn: PgConnection) {
     .collect::<Vec<String>>()
     .join("\n");
 
-    // Verify NormalScanExecState is used (not TopNScanExecState)
+    // Verify NormalScanExecState is used. We can't use TopN because there the limit occurs _after_
+    // the union. And we can't use fast fields, because there are non-fast fields.
     assert!(
         explain_output.contains("NormalScanExecState"),
         "Expected NormalScanExecState in the execution plan"
@@ -1103,7 +1104,7 @@ fn view_no_order_by_limit_pushdown(mut conn: PgConnection) {
     .join("\n");
 
     // Print the explain plan for debugging
-    println!("EXPLAIN output:\n{}", explain_output);
+    println!("EXPLAIN output:\n{explain_output}");
 
     // Verify NormalScanExecState is used (not TopNScanExecState)
     assert!(
@@ -1124,7 +1125,7 @@ fn view_no_order_by_limit_pushdown(mut conn: PgConnection) {
     "#
     .fetch(&mut conn);
 
-    println!("Query results: {:?}", results);
+    println!("Query results: {results:?}");
 
     // Verify we got the right number of results and correct order
     assert_eq!(results.len(), 5, "Expected 5 matching results");
@@ -1140,4 +1141,22 @@ fn view_no_order_by_limit_pushdown(mut conn: PgConnection) {
             prev_date = &result.1;
         }
     }
+}
+
+#[rstest]
+fn expression_with_options(mut conn: PgConnection) {
+    "CALL paradedb.create_bm25_test_table(table_name => 'index_config', schema_name => 'paradedb')"
+        .execute(&mut conn);
+
+    r#"CREATE INDEX index_config_index ON paradedb.index_config
+        USING bm25 (id, lower(description)) WITH (key_field='id')"#
+        .execute(&mut conn);
+
+    let rows: Vec<(String, String)> =
+        "SELECT name, field_type FROM paradedb.schema('paradedb.index_config_index') ORDER BY name"
+            .fetch(&mut conn);
+
+    assert_eq!(rows[0], ("_pg_search_1".into(), "Str".into()));
+    assert_eq!(rows[1], ("ctid".into(), "U64".into()));
+    assert_eq!(rows[2], ("id".into(), "I64".into()));
 }

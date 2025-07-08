@@ -10,34 +10,28 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     branches:
       - main
-      - staging
-      - dev
     paths:
       - ".github/workflows/test-pg_search.yml"
       - "pg_search/**"
       - "tests/**"
       - "tokenizers/**"
   push:
-    branches: # Also run on `main`, `staging` and `dev` to fill the GitHub Actions Rust cache in a way that PRs can see it
+    branches: # Also run on the default branch to fill the GitHub Actions Rust cache in a way that PRs can see it
       - main
-      - staging
-      - dev
     paths:
       - "**/*.rs"
       - "**/*.toml"
   workflow_dispatch:
 
-# - New commits to a feature branch PR cancel previous runs.
-# - Pushes to `dev` get grouped under "dev".
-# - A PR from `dev` to `main` uses the same key as pushes to `dev`, avoiding duplicate runs when doing a promotion.
 concurrency:
-  group: test-pg_search-${{ (github.event_name == 'push' || github.event.pull_request.head.ref == 'dev') && 'dev' || github.event.pull_request.number }}
+  group: test-pg_search-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
   set-matrix:
     name: Define the PostgreSQL Version Matrix
     runs-on: ubuntu-latest
+    if: ${{ !cancelled() && github.event.pull_request.draft == false }}
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
@@ -55,7 +49,7 @@ jobs:
   test-pg_search-postgres:
     name: Test pg_search on PostgreSQL ${{ matrix.pg_version }}
     runs-on: ubicloud-standard-8
-    if: github.event.pull_request.draft == false
+    if: ${{ !cancelled() && github.event.pull_request.draft == false }}
     needs: set-matrix
     strategy:
       matrix:
@@ -68,7 +62,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Extract pgrx Version
         id: pgrx
@@ -77,8 +71,8 @@ jobs:
           version=$(cargo tree --depth 1 -i pgrx -p pg_search | head -n 1 | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
           echo "version=$version" >> $GITHUB_OUTPUT
 
-      # Caches from base branches are available to PRs, but not across unrelated branches, so we only
-      # save the cache on the 'dev' branch, but load it on all branches.
+      # Caches from base branches are available to PRs, but not across unrelated branches,
+      # so we only save the cache on the default branch, but load it on all branches.
       - name: Install Rust Cache
         uses: swatinem/rust-cache@v2
         with:
@@ -86,7 +80,7 @@ jobs:
           key: ${{ matrix.pg_version }}-${{ steps.pgrx.outputs.version }}
           cache-targets: true
           cache-all-crates: true
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install required system tools
         run: sudo apt-get update && sudo apt-get install -y lsof
@@ -170,7 +164,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Extract pgrx Version
         id: pgrx
@@ -179,8 +173,8 @@ jobs:
           version=$(cargo tree --depth 1 -i pgrx -p pg_search | head -n 1 | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
           echo "version=$version" >> $GITHUB_OUTPUT
 
-      # Caches from base branches are available to PRs, but not across unrelated branches, so we only
-      # save the cache on the 'dev' branch, but load it on all branches.
+      # Caches from base branches are available to PRs, but not across unrelated branches,
+      # so we only save the cache on the default branch, but load it on all branches.
       - name: Install Rust Cache
         uses: swatinem/rust-cache@v2
         with:
@@ -188,7 +182,7 @@ jobs:
           key: ${{ matrix.pg_version }}-${{ steps.pgrx.outputs.version }}
           cache-targets: true
           cache-all-crates: true
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install required system tools
         run: sudo apt-get update && sudo apt-get install -y lsof
@@ -221,7 +215,7 @@ jobs:
 
       - name: Compile & install pg_search extension
         working-directory: pg_search/
-        run: cargo pgrx install --sudo --pg-config ~/.pgrx/${{ matrix.pg_version }}.*/pgrx-install/bin/pg_config --features=pg${{ matrix.pg_version }},icu
+        run: cargo pgrx install --pg-config ~/.pgrx/${{ matrix.pg_version }}.*/pgrx-install/bin/pg_config --features=pg${{ matrix.pg_version }},icu
 
       - name: Start Postgres and create database
         working-directory: tests/
@@ -232,5 +226,14 @@ jobs:
       - name: Run pg_search Integration Tests Against pgrx-managed Postgres
         run: RUST_BACKTRACE=1 DATABASE_URL=postgresql://localhost:288${{ matrix.pg_version }}/pg_search cargo test --jobs $(nproc) --no-default-features --features=icu --package tests --package tokenizers -- --skip replication --skip ephemeral
 
+      - name: Run pg_search Regression Tests Against pgrx-managed Postgres
+        run: |
+          set -e
+          if ! cargo pgrx regress --package pg_search pg${{ matrix.pg_version }} --features=icu --auto; then
+            git diff
+            exit 1
+          fi
+
       - name: Print the Postgres Logs
+        if: always()
         run: cat ~/.pgrx/${{ matrix.pg_version}}.log

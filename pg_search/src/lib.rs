@@ -15,7 +15,6 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 #![recursion_limit = "512"]
-#![allow(unexpected_cfgs)]
 
 mod api;
 mod bootstrap;
@@ -25,15 +24,22 @@ mod query;
 mod schema;
 
 pub mod gucs;
+pub mod parallel_worker;
 
 use self::postgres::customscan;
 use pgrx::*;
+
+/// Postgres' value for a `norm_selec` that hasn't been assigned
+const UNASSIGNED_SELECTIVITY: f64 = -1.0;
 
 /// A hardcoded value when we can't figure out a good selectivity value
 const UNKNOWN_SELECTIVITY: f64 = 0.00001;
 
 /// A hardcoded value for parameterized plan queries
 const PARAMETERIZED_SELECTIVITY: f64 = 0.10;
+
+/// The selectivity value indicating the entire relation will be returned
+const FULL_RELATION_SELECTIVITY: f64 = 1.0;
 
 /// An arbitrary value for what it costs for a plan with one of our operators (@@@) to do whatever
 /// initial work it needs to do (open tantivy index, start the query, etc).  The value is largely
@@ -47,29 +53,6 @@ extension_sql!(
     name = "paradedb_grant_all",
     finalize
 );
-
-use once_cell::sync::Lazy;
-use rand::Rng;
-use std::sync::Mutex;
-
-/// For debugging
-#[allow(dead_code)]
-pub static LOG_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-pub fn log_message(message: &str) {
-    let _lock = LOG_MUTEX.lock().unwrap();
-    eprintln!("{}", message);
-}
-
-/// Convenience method for [`pgrx::pg_sys::MyDatabaseId`]
-#[allow(non_snake_case)]
-#[inline(always)]
-pub fn MyDatabaseId() -> u32 {
-    unsafe {
-        // SAFETY:  this static is set by Postgres when the backend first connects and is
-        // never changed afterwards.  As such, it'll always be set whenever this code runs
-        pg_sys::MyDatabaseId.to_u32()
-    }
-}
 
 /// Initializes option parsing
 #[allow(clippy::missing_safety_doc)]
@@ -100,18 +83,20 @@ pub unsafe extern "C-unwind" fn _PG_init() {
 
 #[pg_extern]
 fn random_words(num_words: i32) -> String {
-    let mut rng = rand::thread_rng();
+    use rand::Rng;
+
+    let mut rng = rand::rng();
     let letters = "abcdefghijklmnopqrstuvwxyz";
     let mut result = String::new();
 
     for _ in 0..num_words {
         // Choose a random word length between 3 and 7.
-        let word_length = rng.gen_range(3..=7);
+        let word_length = rng.random_range(3..=7);
         let mut word = String::new();
 
         for _ in 0..word_length {
             // Pick a random letter from the letters string.
-            let random_index = rng.gen_range(0..letters.len());
+            let random_index = rng.random_range(0..letters.len());
             // Safe to use .unwrap() because the index is guaranteed to be valid.
             let letter = letters.chars().nth(random_index).unwrap();
             word.push(letter);

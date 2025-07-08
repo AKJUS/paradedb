@@ -18,6 +18,7 @@
 use super::block::{
     bm25_max_free_space, BM25PageSpecialData, LinkedList, LinkedListData, FIXED_BLOCK_NUMBERS,
 };
+use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::storage::blocklist;
 use crate::postgres::storage::buffer::{BufferManager, PageHeaderMethods};
 use anyhow::Result;
@@ -28,7 +29,6 @@ use std::fmt::Debug;
 use std::io::{Cursor, Read, Write};
 use std::ops::{Deref, Range};
 use std::sync::OnceLock;
-
 // ---------------------------------------------------------------
 // Linked list implementation over block storage,
 // where each node is a page filled with bm25_max_free_space()
@@ -82,6 +82,15 @@ impl LinkedBytesListWriter {
         let mut data_cursor = Cursor::new(bytes);
         let mut bytes_written = 0;
 
+        let new_buffers_needed = {
+            let buffer = self.list.bman.get_buffer(self.last_blockno);
+            let page = buffer.page();
+            let free_space = page.header().free_space();
+            ((bytes.len().saturating_sub(free_space)) as f64 / bm25_max_free_space() as f64).ceil()
+                as usize
+        };
+        let mut new_buffers = self.list.bman.new_buffers(new_buffers_needed);
+
         while bytes_written < bytes.len() {
             check_for_interrupts!();
             self.blocklist_builder.push(self.last_blockno);
@@ -93,7 +102,13 @@ impl LinkedBytesListWriter {
 
             let bytes_to_write = min(free_space, bytes.len() - bytes_written);
             if bytes_to_write == 0 {
-                let mut new_buffer = self.list.bman.new_buffer();
+                let mut new_buffer = new_buffers.next().unwrap_or_else(|| {
+                    panic!(
+                        "{} buffers was not enough for {} bytes",
+                        new_buffers_needed,
+                        bytes.len()
+                    )
+                });
 
                 // Set next blockno
                 let new_blockno = new_buffer.number();
@@ -153,15 +168,13 @@ impl LinkedBytesListWriter {
 impl Write for LinkedBytesListWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         unsafe {
-            self.write(buf)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            self.write(buf).map_err(std::io::Error::other)?;
         }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.flush_inner()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        self.flush_inner().map_err(std::io::Error::other)
     }
 }
 
@@ -191,7 +204,6 @@ impl LinkedList for LinkedBytesList {
 
 #[derive(Debug)]
 pub enum RangeData {
-    OnePage(*const u8, usize),
     MultiPage(Vec<u8>),
 }
 
@@ -208,7 +220,6 @@ impl RangeData {
     #[inline]
     pub fn len(&self) -> usize {
         match self {
-            RangeData::OnePage(_, len) => *len,
             RangeData::MultiPage(vec) => vec.len(),
         }
     }
@@ -216,7 +227,6 @@ impl RangeData {
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
         match self {
-            RangeData::OnePage(ptr, _) => *ptr,
             RangeData::MultiPage(vec) => vec.as_ptr(),
         }
     }
@@ -227,27 +237,27 @@ impl Deref for RangeData {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            RangeData::OnePage(ptr, len) => unsafe { std::slice::from_raw_parts(*ptr, *len) },
             RangeData::MultiPage(vec) => &vec[..],
         }
     }
 }
 
 impl LinkedBytesList {
-    pub fn open(relation_oid: pg_sys::Oid, header_blockno: pg_sys::BlockNumber) -> Self {
+    pub fn open(rel: &PgSearchRelation, header_blockno: pg_sys::BlockNumber) -> Self {
         Self {
-            bman: BufferManager::new(relation_oid),
+            bman: BufferManager::new(rel),
             header_blockno,
             blocklist_reader: Default::default(),
         }
     }
 
-    pub unsafe fn create(relation_oid: pg_sys::Oid) -> Self {
-        let mut bman = BufferManager::new(relation_oid);
+    pub unsafe fn create(rel: &PgSearchRelation) -> Self {
+        let mut bman = BufferManager::new(rel);
+        let mut buffers = bman.new_buffers(2);
 
-        let mut header_buffer = bman.new_buffer();
+        let mut header_buffer = buffers.next().unwrap();
         let header_blockno = header_buffer.number();
-        let mut start_buffer = bman.new_buffer();
+        let mut start_buffer = buffers.next().unwrap();
         let start_blockno = start_buffer.number();
 
         let mut header_page = header_buffer.init_page();
@@ -325,32 +335,6 @@ impl LinkedBytesList {
         self.bman.page_is_empty(self.get_start_blockno().0)
     }
 
-    #[inline]
-    pub unsafe fn get_cached_page_slice(&self, blockno: pg_sys::BlockNumber) -> &[u8] {
-        self.bman
-            .bm25cache()
-            .get_page_slice(blockno, Some(pg_sys::BUFFER_LOCK_SHARE))
-    }
-
-    #[inline]
-    pub unsafe fn get_cached_range(
-        &self,
-        blockno: pg_sys::BlockNumber,
-        range: Range<usize>,
-    ) -> RangeData {
-        const ITEM_SIZE: usize = bm25_max_free_space();
-        let page = self.get_cached_page_slice(blockno);
-        let slice_start = range.start % ITEM_SIZE;
-        let slice_len = range.len();
-        let header_size = std::mem::offset_of!(pg_sys::PageHeaderData, pd_linp);
-        let slice_start = slice_start + header_size;
-        let slice_end = slice_start + slice_len;
-        let slice = &page[slice_start..slice_end];
-
-        // it's all on one page
-        RangeData::OnePage(slice.as_ptr(), slice_len)
-    }
-
     pub unsafe fn get_bytes_range(&self, range: Range<usize>) -> RangeData {
         const ITEM_SIZE: usize = bm25_max_free_space();
 
@@ -360,33 +344,27 @@ impl LinkedBytesList {
             .block_for_ord(start_block_ord)
             .expect("block not found");
 
-        if range.start % ITEM_SIZE + range.len() < ITEM_SIZE {
-            // fits on one page -- use our page cache.  many individual pages are read multiple
-            // times, and using a cache avoids copying the same data
-            self.get_cached_range(blockno, range)
-        } else {
-            // finally, read in the bytes from the blocks that contain the range -- these are specifically not cached
-            let mut data = Vec::with_capacity(range.len());
-            let mut remaining = range.len();
-            while data.len() != range.len() && blockno != pg_sys::InvalidBlockNumber {
-                let buffer = self.bman.get_buffer(blockno);
-                let page = buffer.page();
-                let special = page.special::<BM25PageSpecialData>();
-                let slice_start = if data.is_empty() {
-                    range.start % ITEM_SIZE
-                } else {
-                    0
-                };
-                let slice_len = (ITEM_SIZE - slice_start).min(remaining);
-                let slice = page.as_slice_range(slice_start, slice_len);
+        // finally, read in the bytes from the blocks that contain the range -- these are specifically not cached
+        let mut data = Vec::with_capacity(range.len());
+        let mut remaining = range.len();
+        while data.len() != range.len() && blockno != pg_sys::InvalidBlockNumber {
+            let buffer = self.bman.get_buffer(blockno);
+            let page = buffer.page();
+            let special = page.special::<BM25PageSpecialData>();
+            let slice_start = if data.is_empty() {
+                range.start % ITEM_SIZE
+            } else {
+                0
+            };
+            let slice_len = (ITEM_SIZE - slice_start).min(remaining);
+            let slice = page.as_slice_range(slice_start, slice_len);
 
-                data.extend_from_slice(slice);
-                blockno = special.next_blockno;
-                remaining -= slice_len;
-            }
-
-            RangeData::MultiPage(data)
+            data.extend_from_slice(slice);
+            blockno = special.next_blockno;
+            remaining -= slice_len;
         }
+
+        RangeData::MultiPage(data)
     }
 }
 
@@ -394,6 +372,7 @@ impl LinkedBytesList {
 #[pgrx::pg_schema]
 mod tests {
     use super::*;
+    use crate::postgres::rel::PgSearchRelation;
     use crate::postgres::storage::block::BM25PageSpecialData;
     use crate::postgres::storage::utils::BM25BufferCache;
     use pgrx::prelude::*;
@@ -406,11 +385,12 @@ mod tests {
             Spi::get_one("SELECT oid FROM pg_class WHERE relname = 't_idx' AND relkind = 'i';")
                 .expect("spi should succeed")
                 .unwrap();
+        let indexrel = PgSearchRelation::open(relation_oid);
 
         // Test read/write from newly created linked list
         let bytes: Vec<u8> = (1..=255).cycle().take(100_000).collect();
         let start_blockno = {
-            let linked_list = LinkedBytesList::create(relation_oid);
+            let linked_list = LinkedBytesList::create(&indexrel);
             let mut writer = linked_list.writer();
             writer.write(&bytes).unwrap();
             let linked_list = writer.into_inner().unwrap();
@@ -421,7 +401,7 @@ mod tests {
         };
 
         // Test read from already created linked list
-        let linked_list = LinkedBytesList::open(relation_oid, start_blockno);
+        let linked_list = LinkedBytesList::open(&indexrel, start_blockno);
         let read_bytes = linked_list.read_all();
         assert_eq!(bytes, read_bytes);
     }
@@ -434,8 +414,9 @@ mod tests {
             Spi::get_one("SELECT oid FROM pg_class WHERE relname = 't_idx' AND relkind = 'i';")
                 .expect("spi should succeed")
                 .unwrap();
+        let indexrel = PgSearchRelation::open(relation_oid);
 
-        let linked_list = LinkedBytesList::create(relation_oid);
+        let linked_list = LinkedBytesList::create(&indexrel);
         assert!(linked_list.is_empty());
 
         let bytes: Vec<u8> = (1..=255).cycle().take(100_000).collect();
@@ -453,8 +434,9 @@ mod tests {
             Spi::get_one("SELECT oid FROM pg_class WHERE relname = 't_idx' AND relkind = 'i';")
                 .expect("spi should succeed")
                 .unwrap();
+        let indexrel = PgSearchRelation::open(relation_oid);
 
-        let linked_list = LinkedBytesList::create(relation_oid);
+        let linked_list = LinkedBytesList::create(&indexrel);
         let bytes: Vec<u8> = (1..=255).cycle().take(100_000).collect();
         let mut writer = linked_list.writer();
         writer.write(&bytes).unwrap();
@@ -463,7 +445,7 @@ mod tests {
         linked_list.return_to_fsm();
 
         while blockno != pg_sys::InvalidBlockNumber {
-            let buffer = BM25BufferCache::open(relation_oid)
+            let buffer = BM25BufferCache::open(&indexrel)
                 .get_buffer(blockno, Some(pg_sys::BUFFER_LOCK_SHARE));
             let page = pg_sys::BufferGetPage(buffer);
             let special = pg_sys::PageGetSpecialPointer(page) as *mut BM25PageSpecialData;

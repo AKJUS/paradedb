@@ -18,21 +18,23 @@
 mod searchqueryinput;
 mod text;
 
-use crate::api::index::{fieldname_typoid, FieldName};
+use crate::api::{fieldname_typoid, FieldName};
 use crate::index::mvcc::MvccSatisfies;
 use crate::index::reader::index::SearchIndexReader;
 use crate::nodecast;
-use crate::postgres::utils::locate_bm25_index;
+use crate::postgres::expression::{find_expr_attnum, PG_SEARCH_PREFIX};
+use crate::postgres::rel::PgSearchRelation;
+use crate::postgres::utils::locate_bm25_index_from_heaprel;
+use crate::postgres::var::find_var_relation;
 use crate::query::SearchQueryInput;
 use pgrx::callconv::{BoxRet, FcInfo};
 use pgrx::datum::Datum;
-use pgrx::pg_sys::expression_tree_walker;
+use pgrx::pg_sys::{FuncExpr, NodeTag, OpExpr};
 use pgrx::pgrx_sql_entity_graph::metadata::{
     ArgumentError, Returns, ReturnsError, SqlMapping, SqlTranslatable,
 };
 use pgrx::*;
-use std::ffi::CStr;
-use std::ptr::{addr_of_mut, NonNull};
+use std::ptr::NonNull;
 
 #[derive(Debug)]
 #[repr(transparent)]
@@ -80,7 +82,7 @@ pub fn anyelement_query_input_procoid() -> pg_sys::Oid {
     }
 }
 
-fn anyelement_text_procoid() -> pg_sys::Oid {
+pub fn anyelement_text_procoid() -> pg_sys::Oid {
     unsafe {
         direct_function_call::<pg_sys::Oid>(
             pg_sys::regprocedurein,
@@ -90,7 +92,7 @@ fn anyelement_text_procoid() -> pg_sys::Oid {
     }
 }
 
-fn anyelement_text_opoid() -> pg_sys::Oid {
+pub fn anyelement_text_opoid() -> pg_sys::Oid {
     unsafe {
         direct_function_call::<pg_sys::Oid>(
             pg_sys::regoperatorin,
@@ -125,8 +127,8 @@ pub fn searchqueryinput_typoid() -> pg_sys::Oid {
 }
 
 pub(crate) fn estimate_selectivity(
-    indexrel: &PgRelation,
-    search_query_input: &SearchQueryInput,
+    indexrel: &PgSearchRelation,
+    search_query_input: SearchQueryInput,
 ) -> Option<f64> {
     let reltuples = indexrel
         .heap_relation()
@@ -138,9 +140,14 @@ pub(crate) fn estimate_selectivity(
         return None;
     }
 
-    let search_reader = SearchIndexReader::open(indexrel, MvccSatisfies::Snapshot)
-        .expect("estimate_selectivity: should be able to open a SearchIndexReader");
-    let estimate = search_reader.estimate_docs(search_query_input).unwrap_or(1) as f64;
+    let search_reader = SearchIndexReader::open(
+        indexrel,
+        search_query_input,
+        false,
+        MvccSatisfies::LargestSegment,
+    )
+    .expect("estimate_selectivity: should be able to open a SearchIndexReader");
+    let estimate = search_reader.estimate_docs(reltuples).unwrap_or(1) as f64;
     let mut selectivity = estimate / reltuples;
     if selectivity > 1.0 {
         selectivity = 1.0;
@@ -152,20 +159,20 @@ pub(crate) fn estimate_selectivity(
 unsafe fn make_search_query_input_opexpr_node(
     srs: *mut pg_sys::SupportRequestSimplify,
     input_args: &mut PgList<pg_sys::Node>,
-    var: *mut pg_sys::Var,
+    lhs: *mut pg_sys::Node,
     query: Option<SearchQueryInput>,
-    parse_with_field: Option<(*mut pg_sys::Node, String)>,
+    parse_with_field: Option<(*mut pg_sys::Node, Option<FieldName>)>,
     opoid: pg_sys::Oid,
     procoid: pg_sys::Oid,
 ) -> ReturnedNodePointer {
-    let (relid, _varattno, targetlist) = find_var_relation(var, (*srs).root);
+    let (relid, _nodeattno, targetlist) = find_node_relation(lhs, (*srs).root);
     if relid == pg_sys::Oid::INVALID {
-        panic!("could not determine relation for var");
+        panic!("could not determine relation for node");
     }
 
     // we need to use what should be the only `USING bm25` index on the table
-    let heaprel = PgRelation::open(relid);
-    let indexrel = locate_bm25_index(relid).unwrap_or_else(|| {
+    let heaprel = PgSearchRelation::open(relid);
+    let indexrel = locate_bm25_index_from_heaprel(&heaprel).unwrap_or_else(|| {
         panic!(
             "relation `{}.{}` must have a `USING bm25` index",
             heaprel.namespace(),
@@ -180,36 +187,39 @@ unsafe fn make_search_query_input_opexpr_node(
         .get(0)
         .unwrap_or_else(|| panic!("attribute `{}` not found", keys[0]));
 
-    if let Some(targetlist) = &targetlist {
-        // if we have a targetlist, find the first field of the index definition in it -- its location
-        // in the target list becomes the var's attno
-        let mut found = false;
-        for (i, te) in targetlist.iter_ptr().enumerate() {
-            if te.is_null() {
-                continue;
+    if (*lhs).type_ == NodeTag::T_Var {
+        let var = nodecast!(Var, T_Var, lhs).expect("lhs is not a Var");
+        if let Some(targetlist) = &targetlist {
+            // if we have a targetlist, find the first field of the index definition in it -- its location
+            // in the target list becomes the var's attno
+            let mut found = false;
+            for (i, te) in targetlist.iter_ptr().enumerate() {
+                if te.is_null() {
+                    continue;
+                }
+                if (*te).resorigcol == keys[0] {
+                    (*var).varattno = (i + 1) as _;
+                    (*var).varattnosyn = (*var).varattno;
+                    found = true;
+                    break;
+                }
             }
-            if (*te).resorigcol == keys[0] {
-                (*var).varattno = (i + 1) as _;
-                (*var).varattnosyn = (*var).varattno;
-                found = true;
-                break;
+
+            if !found {
+                panic!("index's first column is not in the var's targetlist");
             }
+        } else {
+            // the Var must look like the first attribute from the index definition
+            (*var).varattno = keys[0];
+            (*var).varattnosyn = (*var).varattno;
         }
 
-        if !found {
-            panic!("index's first column is not in the var's targetlist");
-        }
-    } else {
-        // the Var must look like the first attribute from the index definition
-        (*var).varattno = keys[0];
-        (*var).varattnosyn = (*var).varattno;
+        // the Var must also assume the type of the first attribute from the index definition,
+        // regardless of where we found the Var
+        (*var).vartype = att.atttypid;
+        (*var).vartypmod = att.atttypmod;
+        (*var).varcollid = att.attcollation;
     }
-
-    // the Var must also assume the type of the first attribute from the index definition,
-    // regardless of where we found the Var
-    (*var).vartype = att.atttypid;
-    (*var).vartypmod = att.atttypmod;
-    (*var).varcollid = att.attcollation;
 
     // we're about to fabricate a new pg_sys::OpExpr node to return
     // that represents the `@@@(anyelement, paradedb.searchqueryinput)` operator
@@ -239,23 +249,27 @@ unsafe fn make_search_query_input_opexpr_node(
 
         newopexpr.opno = anyelement_query_input_opoid();
         newopexpr.opfuncid = anyelement_query_input_procoid();
-    } else if let Some((param, attname)) = parse_with_field {
+    } else if let Some((rhs, attname)) = parse_with_field {
         // rewrite the rhs to be a function call to our `paradedb.parse_with_field(...)` function
         let mut parse_with_field_args = PgList::<pg_sys::Node>::new();
 
-        parse_with_field_args.push(
-            pg_sys::makeConst(
-                fieldname_typoid(),
-                -1,
-                pg_sys::Oid::INVALID,
-                -1,
-                FieldName::from(attname).into_datum().unwrap(),
-                false,
-                false,
-            )
-            .cast(),
-        );
-        parse_with_field_args.push(param.cast());
+        if let Some(attname) = attname {
+            parse_with_field_args.push(
+                pg_sys::makeConst(
+                    fieldname_typoid(),
+                    -1,
+                    pg_sys::Oid::INVALID,
+                    -1,
+                    attname.into_datum().unwrap(),
+                    false,
+                    false,
+                )
+                .cast(),
+            );
+        } else {
+            parse_with_field_args.push(lhs);
+        }
+        parse_with_field_args.push(rhs.cast());
         parse_with_field_args.push(
             pg_sys::makeConst(
                 pg_sys::BOOLOID,
@@ -311,131 +325,60 @@ unsafe fn make_search_query_input_opexpr_node(
     ReturnedNodePointer(NonNull::new(newopexpr.cast()))
 }
 
-/// Given a [`pg_sys::Var`] and a [`pg_sys::PlannerInfo`], attempt to find the relation Oid that
-/// contains the var.
+/// Given a [`pg_sys::Node`] and a [`pg_sys::PlannerInfo`], attempt to find the relation Oid that
+/// is referenced by the node.
 ///
-/// It's possible the returned Oid will be [`pg_sys::Oid::INVALID`] if the Var doesn't eventually
-/// come from a relation.
+/// It's possible the returned Oid will be [`pg_sys::Oid::INVALID`] if the Node doesn't eventually
+/// come from a relation. In case of a FuncExpr we stop on the first relation found.
 ///
-/// The returned [`pg_sys::AttrNumber`] is the physical attribute number in the relation the Var
+/// The returned [`pg_sys::AttrNumber`] is the physical attribute number in the relation the Node
 /// is from.
-pub unsafe fn find_var_relation(
-    var: *mut pg_sys::Var,
+pub unsafe fn find_node_relation(
+    node: *mut pg_sys::Node,
     root: *mut pg_sys::PlannerInfo,
 ) -> (
     pg_sys::Oid,
     pg_sys::AttrNumber,
     Option<PgList<pg_sys::TargetEntry>>,
 ) {
-    let query = (*root).parse;
-    let rte = pg_sys::rt_fetch((*var).varno as pg_sys::Index, (*query).rtable);
-
-    match (*rte).rtekind {
-        // the Var comes from a relation
-        pg_sys::RTEKind::RTE_RELATION => ((*rte).relid, (*var).varattno, None),
-
-        // the Var comes from a subquery, so dig into its target list and find the original
-        // table it comes from along with its original column AttributeNumber
-        pg_sys::RTEKind::RTE_SUBQUERY => {
-            let targetlist = PgList::<pg_sys::TargetEntry>::from_pg((*(*rte).subquery).targetList);
-            let te = targetlist
-                .get_ptr((*var).varattno as usize - 1)
-                .expect("var should exist in subquery TargetList");
-            ((*te).resorigtbl, (*te).resorigcol, Some(targetlist))
+    // If the Node is var, immediately return it: otherwise examine the arguments of whatever type
+    // it is.
+    let args = match (*node).type_ {
+        NodeTag::T_Var => return find_var_relation(node.cast(), root),
+        NodeTag::T_FuncExpr => {
+            let funcexpr: *mut FuncExpr = node.cast();
+            PgList::<pg_sys::Node>::from_pg((*funcexpr).args)
         }
+        NodeTag::T_OpExpr => {
+            let opexpr: *mut OpExpr = node.cast();
+            PgList::<pg_sys::Node>::from_pg((*opexpr).args)
+        }
+        _ => return (pg_sys::Oid::INVALID, 0, None),
+    };
 
-        // the Var comes from a CTE, so lookup that CTE and find it in the CTE's target list
-        pg_sys::RTEKind::RTE_CTE => {
-            let mut levelsup = (*rte).ctelevelsup;
-            let mut cteroot = root;
-            while levelsup > 0 {
-                cteroot = (*cteroot).parent_root;
-                if cteroot.is_null() {
-                    // shouldn't happen
-                    panic!(
-                        "bad levelsup for CTE \"{}\"",
-                        CStr::from_ptr((*rte).ctename).to_string_lossy()
-                    )
-                }
-                levelsup -= 1;
+    args.iter_ptr()
+        .filter_map(|arg| match (*arg).type_ {
+            NodeTag::T_FuncExpr | NodeTag::T_OpExpr | NodeTag::T_Var => {
+                Some(find_node_relation(arg, root))
             }
-
-            let rte_ctename = CStr::from_ptr((*rte).ctename);
-            let ctelist = PgList::<pg_sys::CommonTableExpr>::from_pg((*(*cteroot).parse).cteList);
-            let mut matching_cte = None;
-            for cte in ctelist.iter_ptr() {
-                let ctename = CStr::from_ptr((*cte).ctename);
-
-                if ctename == rte_ctename {
-                    matching_cte = Some(cte);
-                    break;
-                }
+            _ => None,
+        })
+        .reduce(|(acc_oid, acc_attno, acc_tl), (oid, _attno, _tl)| {
+            if acc_oid != oid {
+                panic!("expressions cannot contain multiple relations");
             }
-
-            let cte = matching_cte.unwrap_or_else(|| {
-                panic!(
-                    "unable to find cte named \"{}\"",
-                    rte_ctename.to_string_lossy()
-                )
-            });
-
-            if !is_a((*cte).ctequery, pg_sys::NodeTag::T_Query) {
-                panic!("CTE is not a query")
-            }
-            let query = (*cte).ctequery.cast::<pg_sys::Query>();
-            let targetlist = if !(*query).returningList.is_null() {
-                PgList::<pg_sys::TargetEntry>::from_pg((*query).returningList)
-            } else {
-                PgList::<pg_sys::TargetEntry>::from_pg((*query).targetList)
-            };
-            let te = targetlist
-                .get_ptr((*var).varattno as usize - 1)
-                .expect("var should exist in cte TargetList");
-
-            ((*te).resorigtbl, (*te).resorigcol, Some(targetlist))
-        }
-        _ => panic!("unsupported RTEKind: {}", (*rte).rtekind),
-    }
-}
-
-/// Find all the Vars referenced in the specified node
-pub unsafe fn find_vars(node: *mut pg_sys::Node) -> Vec<*mut pg_sys::Var> {
-    #[pg_guard]
-    unsafe extern "C-unwind" fn walker(
-        node: *mut pg_sys::Node,
-        data: *mut core::ffi::c_void,
-    ) -> bool {
-        if node.is_null() {
-            return false;
-        }
-
-        if let Some(var) = nodecast!(Var, T_Var, node) {
-            let data = data.cast::<Data>();
-            (*data).vars.push(var);
-        }
-
-        expression_tree_walker(node, Some(walker), data)
-    }
-
-    struct Data {
-        vars: Vec<*mut pg_sys::Var>,
-    }
-
-    let mut data = Data { vars: Vec::new() };
-
-    walker(node, addr_of_mut!(data).cast());
-    data.vars
+            (acc_oid, acc_attno, acc_tl)
+        })
+        .unwrap_or_else(|| (pg_sys::Oid::INVALID, 0, None))
 }
 
 /// Given a [`pg_sys::PlannerInfo`] and a [`pg_sys::Var`] from it, figure out the name of the `Var`
-///
-/// # Return
 ///
 /// Returns the heap relation [`pg_sys::Oid`] that contains the `Var` along with its name.
 pub unsafe fn attname_from_var(
     root: *mut pg_sys::PlannerInfo,
     var: *mut pg_sys::Var,
-) -> (pg_sys::Oid, Option<String>) {
+) -> (pg_sys::Oid, Option<FieldName>) {
     let (heaprelid, varattno, _) = find_var_relation(var, root);
     if (*var).varattno == 0 {
         return (heaprelid, None);
@@ -447,9 +390,43 @@ pub unsafe fn attname_from_var(
     } else {
         tupdesc
             .get(varattno as usize - 1)
-            .map(|attribute| attribute.name().to_string())
+            .map(|attribute| attribute.name().into())
     };
     (heaprelid, attname)
+}
+
+/// Given a [`pg_sys::PlannerInfo`] and a [`pg_sys::Node`] from it, figure out the name of the `Node`.
+/// It supports `FuncExpr` and `Var` nodes. Note that for the heap relation, the `Var` must be
+/// the first argument of the `FuncExpr`.
+/// This function requires the node to be related to a `bm25` index, otherwise it will panic.
+///
+/// Returns the heap relation [`pg_sys::Oid`] that contains the `Node` along with its name.
+pub unsafe fn fieldname_from_node(
+    root: *mut pg_sys::PlannerInfo,
+    node: *mut pg_sys::Node,
+) -> Option<(pg_sys::Oid, Option<FieldName>)> {
+    match (*node).type_ {
+        NodeTag::T_FuncExpr | NodeTag::T_OpExpr => {
+            // We expect the funcexpr/opexpr to contain the var of the field name we're looking for
+            let (heaprelid, _, _) = find_node_relation(node, root);
+            if heaprelid == pg_sys::Oid::INVALID {
+                panic!("could not find heap relation for node");
+            }
+            let heaprel = PgSearchRelation::open(heaprelid);
+            let indexrel = locate_bm25_index_from_heaprel(&heaprel)
+                .expect("could not find bm25 index for heaprelid");
+
+            let attnum = find_expr_attnum(&indexrel, node)?;
+            let expression_str = format!("{PG_SEARCH_PREFIX}{attnum}").into();
+            Some((heaprelid, Some(expression_str)))
+        }
+        NodeTag::T_Var => {
+            let var = nodecast!(Var, T_Var, node).expect("node is not a Var");
+            let (oid, attname) = attname_from_var(root, var);
+            Some((oid, attname))
+        }
+        _ => None,
+    }
 }
 
 extension_sql!(

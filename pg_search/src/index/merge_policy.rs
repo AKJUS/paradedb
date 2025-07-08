@@ -1,7 +1,7 @@
+use crate::api::{HashMap, HashSet};
 use crate::postgres::storage::block::SegmentMetaEntry;
 use pgrx::pg_sys;
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tantivy::index::{DeleteMeta, InnerSegmentMeta, SegmentId};
@@ -67,7 +67,7 @@ impl MergePolicy for LayeredMergePolicy {
                 .sum::<u64>();
 
         let mut candidates = Vec::new();
-        let mut merged_segments = HashSet::new();
+        let mut merged_segments = HashSet::default();
         let mut layer_sizes = self.layer_sizes.clone();
         layer_sizes.sort_by_key(|size| Reverse(*size)); // largest to smallest
 
@@ -121,8 +121,7 @@ impl MergePolicy for LayeredMergePolicy {
         logger(
             directory,
             &format!(
-                "compute_merge_candidates: candidates before min merge count are {:?}",
-                candidates
+                "compute_merge_candidates: candidates before min merge count are {candidates:?}"
             ),
         );
 
@@ -162,10 +161,7 @@ impl MergePolicy for LayeredMergePolicy {
 
         logger(
             directory,
-            &format!(
-                "compute_merge_candidates: final candidates are {:?}",
-                candidates
-            ),
+            &format!("compute_merge_candidates: final candidates are {candidates:?}"),
         );
 
         candidates

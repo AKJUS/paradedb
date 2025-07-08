@@ -1,9 +1,5 @@
-use crate::index::mvcc::MVCCDirectory;
+use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::types::TantivyValue;
-use crate::postgres::utils::categorize_fields;
-use crate::query::AsFieldType;
-use crate::schema::SearchIndexSchema;
-use tantivy::index::Index;
 use tantivy::query::{
     BooleanQuery, EnableScoring, MoreLikeThis as TantivyMoreLikeThis, Query, Weight,
 };
@@ -118,16 +114,15 @@ impl MoreLikeThisQueryBuilder {
         key_value: OwnedValue,
         index_oid: pgrx::pg_sys::Oid,
     ) -> MoreLikeThisQuery {
-        let index_relation = unsafe { pgrx::PgRelation::open(index_oid) };
+        let index_relation = PgSearchRelation::open(index_oid);
         let heap_relation = index_relation
             .heap_relation()
             .expect("more_like_this: index should have a heap relation");
-        let directory = MVCCDirectory::snapshot(index_relation.oid());
-        let index = Index::open(directory).expect("more_like_this: should be able to open index");
-        let schema = SearchIndexSchema::open(index.schema(), &index_relation);
-        let key_field_name = schema.key_field().name.0;
-        let key_oid = (&index_relation, &schema).key_field().1;
-        let categorized_fields = categorize_fields(&index_relation.tuple_desc(), &schema);
+        let schema = index_relation
+            .schema()
+            .expect("more_like_this: should be able to open schema");
+        let (key_field_name, key_field_type) = (schema.key_field_name(), schema.key_field_type());
+        let categorized_fields = schema.categorized_fields();
 
         let doc_fields: Vec<(Field, Vec<OwnedValue>)> = pgrx::Spi::connect(|client| {
             let mut doc_fields = Vec::new();
@@ -142,19 +137,19 @@ impl MoreLikeThisQueryBuilder {
                     None,
                     unsafe {
                         &[TantivyValue(key_value)
-                            .try_into_datum(key_oid)
+                            .try_into_datum(key_field_type.typeoid())
                             .expect("more_like_this: should be able to convert key value to datum")
                             .into()]
                     },
                 )?
                 .first();
 
-            for (field, categorized) in categorized_fields {
-                if field.name.0 == "ctid" {
+            for (search_field, categorized) in categorized_fields.iter() {
+                if search_field.is_ctid() {
                     continue;
                 }
 
-                if let Some(datum) = result.get_datum_by_name(field.name.0)? {
+                if let Some(datum) = result.get_datum_by_name(search_field.field_name().root())? {
                     if categorized.is_array {
                         let values = unsafe {
                             TantivyValue::try_from_datum_array(datum, categorized.base_oid)
@@ -163,7 +158,7 @@ impl MoreLikeThisQueryBuilder {
                                 .map(|v| v.into())
                                 .collect::<Vec<_>>()
                         };
-                        doc_fields.push((field.id.0, values));
+                        doc_fields.push((search_field.field(), values));
                     } else if categorized.is_json {
                         let values = unsafe {
                             TantivyValue::try_from_datum_json(datum, categorized.base_oid)
@@ -172,13 +167,13 @@ impl MoreLikeThisQueryBuilder {
                                 .map(|v| v.into())
                                 .collect::<Vec<_>>()
                         };
-                        doc_fields.push((field.id.0, values));
+                        doc_fields.push((search_field.field(), values));
                     } else {
                         let value = unsafe {
                             TantivyValue::try_from_datum(datum, categorized.base_oid)
                                 .expect("more_like_this: should be able to convert datum to tantivy value")
                         };
-                        doc_fields.push((field.id.0, vec![value.into()]));
+                        doc_fields.push((search_field.field(), vec![value.into()]));
                     }
                 }
             }

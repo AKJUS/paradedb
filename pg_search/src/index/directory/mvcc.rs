@@ -16,21 +16,20 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use super::utils::{load_metas, save_new_metas, save_schema, save_settings};
-use crate::index::channel::{ChannelRequest, ChannelRequestHandler};
+use crate::api::{HashMap, HashSet};
 use crate::index::reader::segment_component::SegmentComponentReader;
 use crate::index::writer::segment_component::SegmentComponentWriter;
+use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::storage::block::{
     bm25_max_free_space, FileEntry, MVCCEntry, SegmentMetaEntry, SEGMENT_METAS_START,
 };
 use crate::postgres::storage::buffer::{BufferManager, PinnedBuffer};
 use crate::postgres::storage::LinkedItemList;
-use crossbeam::channel::Receiver;
+use crate::postgres::storage::MAX_BUFFERS_TO_EXTEND_BY;
 use parking_lot::Mutex;
-use pgrx::{pg_sys, PgRelation};
-use rustc_hash::FxHashMap;
+use pgrx::pg_sys;
 use std::any::Any;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Debug, Display};
 use std::panic::panic_any;
@@ -43,40 +42,33 @@ use tantivy::directory::error::{
     DeleteError, LockError, OpenDirectoryError, OpenReadError, OpenWriteError,
 };
 use tantivy::directory::{
-    DirectoryLock, DirectoryPanicHandler, FileHandle, Lock, WatchCallback, WatchHandle, WritePtr,
+    DirectoryLock, DirectoryPanicHandler, FileHandle, Lock, TerminatingWrite, WatchCallback,
+    WatchHandle,
 };
 use tantivy::index::SegmentId;
 use tantivy::{index::SegmentMetaInventory, Directory, IndexMeta, TantivyError};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// By default Tantivy writes 8192 bytes at a time (the `BufWriter` default).
+/// We want to write more at a time so we can allocate chunks of blocks all at once,
+/// which creates less lock contention than allocating one block at a time.
+pub const BUFWRITER_CAPACITY: usize = bm25_max_free_space() * MAX_BUFFERS_TO_EXTEND_BY;
+
+/// Describes how a [`MvccDirectory`] should resolve segment visibility.  Note that
+/// this enum is purposely non-cloneable.  Wrap it with an [`Arc`] if you need that.  Because of
+/// the [`MvccSatisfies::ParallelWorker`] variant, cloning could be incredibly expensive when
+/// an index has many (thousands!) of segments.
+#[derive(Debug, PartialEq, Eq)]
 pub enum MvccSatisfies {
     ParallelWorker(HashSet<SegmentId>),
+    LargestSegment,
     Snapshot,
     Vacuum,
     Mergeable,
 }
 
 impl MvccSatisfies {
-    pub fn directory(self, index_relation: &PgRelation) -> MVCCDirectory {
-        match self {
-            MvccSatisfies::ParallelWorker(segment_ids) => {
-                MVCCDirectory::parallel_worker(index_relation.oid(), segment_ids)
-            }
-            MvccSatisfies::Snapshot => MVCCDirectory::snapshot(index_relation.oid()),
-            MvccSatisfies::Vacuum => MVCCDirectory::vacuum(index_relation.oid()),
-            MvccSatisfies::Mergeable => MVCCDirectory::mergeable(index_relation.oid()),
-        }
-    }
-    pub fn channel_request_handler(
-        self,
-        index_relation: &PgRelation,
-        receiver: Receiver<ChannelRequest>,
-    ) -> ChannelRequestHandler {
-        ChannelRequestHandler::open(
-            self.directory(index_relation),
-            index_relation.oid(),
-            receiver,
-        )
+    pub fn directory(self, index_relation: &PgSearchRelation) -> MVCCDirectory {
+        MVCCDirectory::with_mvcc_style(index_relation, self)
     }
 }
 
@@ -84,17 +76,20 @@ type AtomicFileEntry = (FileEntry, Arc<AtomicUsize>);
 /// Tantivy Directory trait implementation over block storage
 /// This Directory implementation respects Postgres MVCC visibility rules
 /// and should back all Tantivy Indexes used in insert and scan operations
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct MVCCDirectory {
-    relation_oid: pg_sys::Oid,
-    snapshot: Option<pg_sys::Snapshot>,
-    mvcc_style: MvccSatisfies,
+    //
+    // NB:  Directories get cloned, **A LOT**, by tantivy.  As such, it should be cheap, especially
+    // in terms of memory usage, to clone this struct.
+    //
+    indexrel: PgSearchRelation,
+    mvcc_style: Arc<MvccSatisfies>,
 
     // keep a cache of readers behind an Arc<Mutex<_>> so that if/when this MVCCDirectory is
     // cloned, we don't lose all the work we did originally creating the FileHandler impls.  And
     // it's cloned a lot!
-    readers: Arc<Mutex<FxHashMap<PathBuf, Arc<dyn FileHandle>>>>,
-    new_files: Arc<Mutex<FxHashMap<PathBuf, AtomicFileEntry>>>,
+    readers: Arc<Mutex<HashMap<PathBuf, Arc<dyn FileHandle>>>>,
+    new_files: Arc<Mutex<HashMap<PathBuf, AtomicFileEntry>>>,
 
     // a lazily loaded [`IndexMeta`], which is only created once per MVCCDirectory instance
     // we cannot tolerate tantivy calling `load_metas()` multiple times and giving it a different
@@ -102,53 +97,30 @@ pub struct MVCCDirectory {
     loaded_metas: OnceLock<Arc<tantivy::Result<IndexMeta>>>,
     all_entries: Arc<Mutex<HashMap<SegmentId, SegmentMetaEntry>>>,
     pin_cushion: Arc<Mutex<Option<PinCushion>>>,
+    total_segment_count: Arc<AtomicUsize>,
 }
 
 unsafe impl Send for MVCCDirectory {}
 unsafe impl Sync for MVCCDirectory {}
 
 impl MVCCDirectory {
-    pub fn parallel_worker(relation_oid: pg_sys::Oid, segment_ids: HashSet<SegmentId>) -> Self {
-        Self::with_mvcc_style(
-            relation_oid,
-            MvccSatisfies::ParallelWorker(segment_ids),
-            None,
-        )
-    }
-
-    pub fn snapshot(relation_oid: pg_sys::Oid) -> Self {
-        let snapshot = unsafe {
-            assert!(
-                pg_sys::ActiveSnapshotSet(),
-                "must have an active snapshot set"
-            );
-            pg_sys::GetActiveSnapshot()
-        };
-        Self::with_mvcc_style(relation_oid, MvccSatisfies::Snapshot, Some(snapshot))
-    }
-
-    pub fn vacuum(relation_oid: pg_sys::Oid) -> Self {
-        Self::with_mvcc_style(relation_oid, MvccSatisfies::Vacuum, None)
-    }
-
-    pub fn mergeable(relation_oid: pg_sys::Oid) -> Self {
-        Self::with_mvcc_style(relation_oid, MvccSatisfies::Mergeable, None)
-    }
-
-    fn with_mvcc_style(
-        relation_oid: pg_sys::Oid,
-        mvcc_style: MvccSatisfies,
-        snapshot: Option<pg_sys::Snapshot>,
+    pub fn parallel_worker(
+        index_relation: &PgSearchRelation,
+        segment_ids: HashSet<SegmentId>,
     ) -> Self {
+        Self::with_mvcc_style(index_relation, MvccSatisfies::ParallelWorker(segment_ids))
+    }
+
+    pub fn with_mvcc_style(index_relation: &PgSearchRelation, mvcc_style: MvccSatisfies) -> Self {
         Self {
-            relation_oid,
-            snapshot,
-            mvcc_style,
+            indexrel: Clone::clone(index_relation),
+            mvcc_style: Arc::new(mvcc_style),
             readers: Default::default(),
             new_files: Default::default(),
             loaded_metas: Default::default(),
             pin_cushion: Default::default(),
             all_entries: Default::default(),
+            total_segment_count: Default::default(),
         }
     }
 
@@ -209,6 +181,16 @@ impl MVCCDirectory {
     pub(crate) fn all_entries(&self) -> HashMap<SegmentId, SegmentMetaEntry> {
         self.all_entries.lock().clone()
     }
+
+    /// Returns the [`AtomicUsize`] where the number of segments that survive [`load_metas()`]'
+    /// visibility checking gets stored once [`load_metas()`] has actually been called.
+    ///
+    /// An implementation detail behind the value calculation is that there's special casing for
+    /// [`MvccSatisfies::LargestSegment`] in that it will use the count of **all** "Snapshot"-visible
+    /// segments rather than `1` (one).
+    pub(crate) fn total_segment_count(&self) -> Arc<AtomicUsize> {
+        self.total_segment_count.clone()
+    }
 }
 
 impl Directory for MVCCDirectory {
@@ -229,8 +211,7 @@ impl Directory for MVCCDirectory {
                                 }
                             } else {
                                 return Err(OpenReadError::IoError {
-                                    io_error: io::Error::new(io::ErrorKind::Other, err.to_string())
-                                        .into(),
+                                    io_error: io::Error::other(err.to_string()).into(),
                                     filepath: PathBuf::from(path),
                                 });
                             }
@@ -239,7 +220,7 @@ impl Directory for MVCCDirectory {
                 };
                 Ok(vacant
                     .insert(Arc::new(unsafe {
-                        SegmentComponentReader::new(self.relation_oid, file_entry)
+                        SegmentComponentReader::new(&self.indexrel, file_entry)
                     }))
                     .clone())
             }
@@ -257,17 +238,16 @@ impl Directory for MVCCDirectory {
     }
 
     /// Returns a segment writer that implements std::io::Write
-    /// Our [`ChannelDirectory`] is what gets called for doing writes, not this impl
-    fn open_write(&self, path: &Path) -> result::Result<WritePtr, OpenWriteError> {
-        let writer = unsafe { SegmentComponentWriter::new(self.relation_oid, path) };
+    fn open_write_inner(
+        &self,
+        path: &Path,
+    ) -> result::Result<Box<dyn TerminatingWrite>, OpenWriteError> {
+        let writer = unsafe { SegmentComponentWriter::new(&self.indexrel, path) };
         self.new_files.lock().insert(
             path.to_path_buf(),
             (writer.file_entry(), writer.total_bytes()),
         );
-        Ok(io::BufWriter::with_capacity(
-            bm25_max_free_space(),
-            Box::new(writer),
-        ))
+        Ok(Box::new(writer))
     }
 
     /// atomic_read is used by Tantivy to read from managed.json and meta.json
@@ -305,10 +285,10 @@ impl Directory for MVCCDirectory {
 
     /// Returns a list of all segment components to Tantivy,
     /// identified by <uuid>.<ext> PathBufs
-    fn list_managed_files(&self) -> tantivy::Result<HashSet<PathBuf>> {
+    fn list_managed_files(&self) -> tantivy::Result<std::collections::HashSet<PathBuf>> {
         unsafe {
             let segment_metas =
-                LinkedItemList::<SegmentMetaEntry>::open(self.relation_oid, SEGMENT_METAS_START);
+                LinkedItemList::<SegmentMetaEntry>::open(&self.indexrel, SEGMENT_METAS_START);
             Ok(segment_metas
                 .list()
                 .iter()
@@ -337,9 +317,8 @@ impl Directory for MVCCDirectory {
         previous_meta: &IndexMeta,
         payload: &mut (dyn Any + '_),
     ) -> tantivy::Result<()> {
-        let mut file_entries = FxHashMap::default();
-        let payload = if let Some(payload) = payload.downcast_mut::<FxHashMap<PathBuf, FileEntry>>()
-        {
+        let mut file_entries = HashMap::default();
+        let payload = if let Some(payload) = payload.downcast_mut::<HashMap<PathBuf, FileEntry>>() {
             payload
         } else {
             for (path, (file_entry, total_bytes)) in self.new_files.lock().iter() {
@@ -355,10 +334,10 @@ impl Directory for MVCCDirectory {
         };
 
         // Save Schema and IndexSettings if this is the first time
-        save_schema(self.relation_oid, &meta.schema)
+        save_schema(&self.indexrel, &meta.schema)
             .map_err(|err| tantivy::TantivyError::SchemaError(err.to_string()))?;
 
-        save_settings(self.relation_oid, &meta.index_settings)
+        save_settings(&self.indexrel, &meta.index_settings)
             .map_err(|err| tantivy::TantivyError::InternalError(err.to_string()))?;
 
         // If there were no new segments, skip the rest of the work
@@ -367,7 +346,7 @@ impl Directory for MVCCDirectory {
         }
 
         unsafe {
-            save_new_metas(self.relation_oid, meta, previous_meta, payload)
+            save_new_metas(&self.indexrel, meta, previous_meta, payload)
                 .map_err(|err| tantivy::TantivyError::InternalError(err.to_string()))?;
         }
 
@@ -377,19 +356,25 @@ impl Directory for MVCCDirectory {
     fn load_metas(&self, inventory: &SegmentMetaInventory) -> tantivy::Result<IndexMeta> {
         let loaded_metas = self.loaded_metas.get_or_init(|| unsafe {
             match load_metas(
-                self.relation_oid,
+                &self.indexrel,
                 inventory,
-                self.snapshot,
                 &self.mvcc_style,
+                self.indexrel
+                    .schema()
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .tantivy_schema(),
             ) {
                 Err(e) => Arc::new(Err(e)),
-                Ok((all_entries, index_meta, pin_cushion)) => {
-                    *self.all_entries.lock() = all_entries
+                Ok(loaded) => {
+                    *self.all_entries.lock() = loaded
+                        .entries
                         .into_iter()
                         .map(|entry| (entry.segment_id, entry))
                         .collect();
-                    *self.pin_cushion.lock() = Some(pin_cushion);
-                    Arc::new(Ok(index_meta))
+                    *self.pin_cushion.lock() = Some(loaded.pin_cushion);
+                    self.total_segment_count
+                        .store(loaded.total_segments, Ordering::Relaxed);
+                    Arc::new(Ok(loaded.meta))
                 }
             }
         });
@@ -452,6 +437,10 @@ impl Directory for MVCCDirectory {
     fn log(&self, message: &str) {
         pgrx::debug1!("{message}");
     }
+
+    fn bufwriter_capacity(&self) -> usize {
+        BUFWRITER_CAPACITY
+    }
 }
 
 #[derive(Default, Debug)]
@@ -467,16 +456,21 @@ impl PinCushion {
     pub fn remove(&mut self, blockno: pg_sys::BlockNumber) {
         self.0.remove(&blockno);
     }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {
     use super::*;
+    use crate::postgres::rel::PgSearchRelation;
     use pgrx::prelude::*;
 
     #[pg_test]
-    fn test_list_meta_entries() {
+    unsafe fn test_list_meta_entries() {
         Spi::run("CREATE TABLE t (id SERIAL, data TEXT);").unwrap();
         Spi::run("INSERT INTO t (data) VALUES ('test');").unwrap();
         Spi::run("CREATE INDEX t_idx ON t USING bm25(id, data) WITH (key_field = 'id')").unwrap();
@@ -484,9 +478,8 @@ mod tests {
             Spi::get_one("SELECT oid FROM pg_class WHERE relname = 't_idx' AND relkind = 'i';")
                 .expect("spi should succeed")
                 .unwrap();
-
-        let linked_list =
-            LinkedItemList::<SegmentMetaEntry>::open(relation_oid, SEGMENT_METAS_START);
+        let indexrel = PgSearchRelation::open(relation_oid);
+        let linked_list = LinkedItemList::<SegmentMetaEntry>::open(&indexrel, SEGMENT_METAS_START);
         let mut listed_files = unsafe { linked_list.list() };
         assert_eq!(listed_files.len(), 1);
         let entry = listed_files.pop().unwrap();

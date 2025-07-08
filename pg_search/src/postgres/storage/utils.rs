@@ -15,11 +15,14 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::storage::block::{bm25_max_free_space, BM25PageSpecialData, PgItem};
-use parking_lot::Mutex;
-use pgrx::pg_sys;
 use pgrx::pg_sys::OffsetNumber;
-use rustc_hash::FxHashMap;
+use pgrx::{check_for_interrupts, pg_sys};
+use std::fmt::Debug;
+
+/// Matches Postgres's [`MAX_BUFFERS_TO_EXTEND_BY`]
+pub const MAX_BUFFERS_TO_EXTEND_BY: usize = 64;
 
 pub trait BM25Page {
     /// Read the opaque, non-decoded [`PgItem`] at `offno`.
@@ -76,48 +79,105 @@ impl BM25Page for pg_sys::Page {
     }
 }
 
+#[cfg(any(feature = "pg16", feature = "pg17"))]
+mod bas_bulkwrite {
+    use pgrx::{pg_sys, PgMemoryContexts};
+    use std::sync::LazyLock;
+
+    pub(super) struct BufferAccessStrategyHolder(pub(super) pg_sys::BufferAccessStrategy);
+    unsafe impl Send for BufferAccessStrategyHolder {}
+    unsafe impl Sync for BufferAccessStrategyHolder {}
+
+    pub(super) static BAS_BULKWRITE: LazyLock<BufferAccessStrategyHolder> = LazyLock::new(|| {
+        BufferAccessStrategyHolder(unsafe {
+            // SAFETY:  Allocated in `TopMemoryContext`, once, so that it's always available
+            PgMemoryContexts::TopMemoryContext.switch_to(|_| {
+                pg_sys::GetAccessStrategy(pg_sys::BufferAccessStrategyType::BAS_BULKWRITE)
+            })
+        })
+    });
+}
+
 #[derive(Debug)]
 pub struct BM25BufferCache {
-    indexrel: pg_sys::Relation,
-    heaprel: pg_sys::Relation,
-    cache: Mutex<FxHashMap<pg_sys::BlockNumber, Vec<u8>>>,
+    rel: PgSearchRelation,
 }
 
 unsafe impl Send for BM25BufferCache {}
 unsafe impl Sync for BM25BufferCache {}
 
 impl BM25BufferCache {
-    pub fn open(indexrelid: pg_sys::Oid) -> Self {
-        unsafe {
-            let indexrel = pg_sys::RelationIdGetRelation(indexrelid);
-            let heaprelid = pg_sys::IndexGetRelation(indexrelid, false);
-            let heaprel = pg_sys::RelationIdGetRelation(heaprelid);
-            Self {
-                indexrel,
-                heaprel,
-                cache: Default::default(),
-            }
+    pub fn open(rel: &PgSearchRelation) -> Self {
+        Self {
+            rel: Clone::clone(rel),
         }
     }
 
-    pub unsafe fn heaprel(&self) -> *mut pg_sys::RelationData {
-        self.heaprel
+    pub fn rel(&self) -> &PgSearchRelation {
+        &self.rel
     }
 
-    pub unsafe fn indexrel(&self) -> *mut pg_sys::RelationData {
-        self.indexrel
+    unsafe fn bulk_extend_relation(
+        &self,
+        npages: usize,
+    ) -> [pg_sys::Buffer; MAX_BUFFERS_TO_EXTEND_BY] {
+        let mut buffers = [pg_sys::InvalidBuffer as pg_sys::Buffer; MAX_BUFFERS_TO_EXTEND_BY];
+
+        #[cfg(any(feature = "pg16", feature = "pg17"))]
+        {
+            // `ExtendBufferedRelBy` is only allowed from certain backends
+            let can_use_extend_buffered_rel_by = npages > 1
+                && (pg_sys::MyBackendType == pg_sys::BackendType::B_BG_WORKER
+                    || pg_sys::MyBackendType == pg_sys::BackendType::B_BACKEND);
+
+            if can_use_extend_buffered_rel_by {
+                let mut filled = 0;
+                let mut extended_by = 0;
+                loop {
+                    check_for_interrupts!();
+                    let bmr = pg_sys::BufferManagerRelation {
+                        rel: self.rel.as_ptr(),
+                        ..Default::default()
+                    };
+                    pg_sys::ExtendBufferedRelBy(
+                        bmr,
+                        pg_sys::ForkNumber::MAIN_FORKNUM,
+                        bas_bulkwrite::BAS_BULKWRITE.0,
+                        0,
+                        (npages - filled) as _,
+                        buffers.as_mut_ptr().add(filled),
+                        &mut extended_by,
+                    );
+                    filled += extended_by as usize;
+                    extended_by = 0;
+                    if filled == npages {
+                        break;
+                    }
+                }
+
+                return buffers;
+            }
+        }
+
+        pg_sys::LockRelationForExtension(self.rel.as_ptr(), pg_sys::AccessExclusiveLock as i32);
+        for buffer in buffers.iter_mut().take(npages) {
+            *buffer = self.get_buffer(pg_sys::InvalidBlockNumber, None);
+        }
+        pg_sys::UnlockRelationForExtension(self.rel.as_ptr(), pg_sys::AccessExclusiveLock as i32);
+        buffers
     }
 
-    pub unsafe fn new_buffer(&self) -> pg_sys::Buffer {
-        // Try to find a recyclable page
+    unsafe fn recycled_buffer(&self) -> Option<pg_sys::Buffer> {
         loop {
+            check_for_interrupts!();
             // ask for a page with at least `bm25_max_free_space()` -- that's how much we need to do our things
-            let blockno = pg_sys::GetPageWithFreeSpace(self.indexrel, bm25_max_free_space() as _);
+            let blockno =
+                pg_sys::GetPageWithFreeSpace(self.rel.as_ptr(), bm25_max_free_space() as _);
             if blockno == pg_sys::InvalidBlockNumber {
-                break;
+                return None;
             }
             // we got one, so let Postgres know so the FSM will stop considering it
-            pg_sys::RecordUsedIndexPage(self.indexrel, blockno);
+            pg_sys::RecordUsedIndexPage(self.rel.as_ptr(), blockno);
 
             let buffer = self.get_buffer(blockno, None);
             if pg_sys::ConditionalLockBuffer(buffer) {
@@ -129,7 +189,7 @@ impl BM25BufferCache {
                 // between then and now some other backend could have gotten this page too, locked it,
                 // (re)initialized it, and released its lock, making it unusable by us
                 if page.is_reusable() {
-                    return buffer;
+                    return Some(buffer);
                 }
 
                 pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
@@ -137,18 +197,43 @@ impl BM25BufferCache {
 
             pg_sys::ReleaseBuffer(buffer);
         }
+    }
 
-        // No recyclable pages found, create a new page
-        // Postgres requires an exclusive lock on the relation to create a new page
-        pg_sys::LockRelationForExtension(self.indexrel, pg_sys::ExclusiveLock as i32);
+    pub unsafe fn new_buffer(&self) -> pg_sys::Buffer {
+        self.recycled_buffer().unwrap_or_else(|| {
+            let buffer = self.bulk_extend_relation(1)[0];
+            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
+            buffer
+        })
+    }
 
-        let buffer = self.get_buffer(
-            pg_sys::InvalidBlockNumber,
-            Some(pg_sys::BUFFER_LOCK_EXCLUSIVE),
-        );
+    pub unsafe fn new_buffers(&self, npages: usize) -> BufferMutVec {
+        let mut buffers =
+            [(pg_sys::InvalidBuffer as pg_sys::Buffer, false); MAX_BUFFERS_TO_EXTEND_BY];
+        let mut remaining = npages;
+        let mut cursor = 0;
 
-        pg_sys::UnlockRelationForExtension(self.indexrel, pg_sys::ExclusiveLock as i32);
-        buffer
+        while remaining > 0 {
+            if let Some(buffer) = self.recycled_buffer() {
+                // recycled_buffers() returns buffers that are already locked
+                buffers[cursor] = (buffer, false);
+                cursor += 1;
+                remaining -= 1;
+            } else {
+                break;
+            }
+        }
+
+        if remaining > 0 {
+            let extended_buffers = self.bulk_extend_relation(remaining);
+            // bulk_extend_relation() returns buffers that are not locked
+            for buffer in extended_buffers.iter().take(remaining) {
+                buffers[cursor] = (*buffer, true);
+                cursor += 1;
+            }
+        }
+
+        BufferMutVec::new(buffers)
     }
 
     pub unsafe fn get_buffer(
@@ -166,7 +251,7 @@ impl BM25BufferCache {
         lock: Option<u32>,
     ) -> pg_sys::Buffer {
         let buffer = pg_sys::ReadBufferExtended(
-            self.indexrel,
+            self.rel.as_ptr(),
             pg_sys::ForkNumber::MAIN_FORKNUM,
             blockno,
             pg_sys::ReadBufferMode::RBM_NORMAL,
@@ -178,124 +263,74 @@ impl BM25BufferCache {
         }
         buffer
     }
-
-    pub unsafe fn get_page_slice(&self, blockno: pg_sys::BlockNumber, lock: Option<u32>) -> &[u8] {
-        let mut cache = self.cache.lock();
-        let slice = cache.entry(blockno).or_insert_with(|| {
-            let buffer = self.get_buffer(blockno, lock);
-            let page = pg_sys::BufferGetPage(buffer);
-            let data =
-                std::slice::from_raw_parts(page as *mut u8, pg_sys::BLCKSZ as usize).to_vec();
-            pg_sys::UnlockReleaseBuffer(buffer);
-
-            data
-        });
-
-        std::slice::from_raw_parts(slice.as_ptr(), slice.len())
-    }
 }
 
-impl Drop for BM25BufferCache {
-    fn drop(&mut self) {
-        unsafe {
-            if crate::postgres::utils::IsTransactionState() {
-                pg_sys::RelationClose(self.indexrel);
-                pg_sys::RelationClose(self.heaprel);
+/// Holds an array of buffers -- used for bulk allocating new buffers.
+///
+/// These buffers can either be locked (if retrieved from the FSM) or unlocked (if the relation was extended)
+/// [`BufferMutVec`] locks/releases them appropriately when they are claimed/dropped.
+type NeedsLock = bool;
+pub struct BufferMutVec {
+    inner: [(pg_sys::Buffer, NeedsLock); MAX_BUFFERS_TO_EXTEND_BY],
+    cursor: usize,
+}
+
+impl BufferMutVec {
+    pub fn new(buffers: [(pg_sys::Buffer, NeedsLock); MAX_BUFFERS_TO_EXTEND_BY]) -> Self {
+        Self {
+            inner: buffers,
+            cursor: 0,
+        }
+    }
+
+    /// Claim a buffer from the start, which ensures that the buffers are in the same order as they were created.
+    /// Typically this means in order of increasing block number.
+    pub fn next(&mut self) -> Option<pg_sys::Buffer> {
+        if self.cursor >= MAX_BUFFERS_TO_EXTEND_BY {
+            return None;
+        }
+
+        let (buffer, needs_lock) = self.inner[self.cursor];
+        self.cursor += 1;
+
+        if buffer == pg_sys::InvalidBuffer as pg_sys::Buffer {
+            return None;
+        }
+
+        if needs_lock {
+            unsafe {
+                pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
             }
         }
+        Some(buffer)
     }
 }
 
-/// Get the freeze limit for marking XIDs as frozen
-/// Inspired by vacuum_get_cutoffs in backend/commands/vacuum.c
-pub unsafe fn vacuum_get_freeze_limit(heap_relation: pg_sys::Relation) -> pg_sys::TransactionId {
-    extern "C" {
-        pub static mut autovacuum_freeze_max_age: ::std::os::raw::c_int;
-    }
+impl Drop for BufferMutVec {
+    fn drop(&mut self) {
+        if unsafe { pg_sys::InterruptHoldoffCount > 0 }
+            && unsafe { crate::postgres::utils::IsTransactionState() }
+        {
+            loop {
+                if self.cursor >= MAX_BUFFERS_TO_EXTEND_BY {
+                    break;
+                }
 
-    let oldest_xmin = pg_sys::GetOldestNonRemovableTransactionId(heap_relation);
+                unsafe {
+                    let (buffer, needs_lock) = self.inner[self.cursor];
+                    if buffer == pg_sys::InvalidBuffer as pg_sys::Buffer {
+                        break;
+                    }
 
-    assert!(pg_sys::TransactionIdIsNormal(oldest_xmin));
-    assert!(pg_sys::vacuum_freeze_min_age >= 0);
+                    if needs_lock {
+                        pg_sys::ReleaseBuffer(buffer);
+                    } else {
+                        pg_sys::UnlockReleaseBuffer(buffer);
+                    }
 
-    let next_xid = pg_sys::TransactionId::from(pg_sys::ReadNextFullTransactionId().value as u32);
-    let freeze_min_age =
-        std::cmp::min(pg_sys::vacuum_freeze_min_age, autovacuum_freeze_max_age / 2);
-    if freeze_min_age > next_xid.into_inner() as i32 {
-        return pg_sys::FirstNormalTransactionId;
-    }
-
-    let mut freeze_limit =
-        pg_sys::TransactionId::from(next_xid.into_inner() - (freeze_min_age as u32));
-    // ensure that freeze_limit is a normal transaction ID
-    if !pg_sys::TransactionIdIsNormal(freeze_limit) {
-        freeze_limit = pg_sys::FirstNormalTransactionId;
-    }
-    // freeze_limit must always be <= oldest_xmin
-    if pg_sys::TransactionIdPrecedes(oldest_xmin, freeze_limit) {
-        freeze_limit = oldest_xmin;
-    }
-    freeze_limit
-}
-
-#[cfg(any(test, feature = "pg_test"))]
-#[pgrx::pg_schema]
-mod tests {
-    use super::*;
-    use pgrx::prelude::*;
-
-    #[pg_test]
-    unsafe fn test_freeze_limit_relaxed() {
-        let vacuum_freeze_min_age = 50_000_000;
-
-        Spi::run(&format!(
-            "SET vacuum_freeze_min_age = {};",
-            vacuum_freeze_min_age
-        ))
-        .unwrap();
-        Spi::run("CREATE TABLE t (id SERIAL, data TEXT);").unwrap();
-
-        let heap_oid: pg_sys::Oid =
-            Spi::get_one("SELECT oid FROM pg_class WHERE relname = 't' AND relnamespace = current_schema()::regnamespace;")
-                .expect("spi should succeed")
-                .unwrap();
-        let heap_relation = pg_sys::RelationIdGetRelation(heap_oid);
-
-        if pg_sys::ReadNextFullTransactionId().value <= vacuum_freeze_min_age as u64 {
-            assert_eq!(
-                vacuum_get_freeze_limit(heap_relation),
-                pg_sys::FirstNormalTransactionId
-            );
-        } else {
-            assert!(vacuum_get_freeze_limit(heap_relation) > pg_sys::FirstNormalTransactionId);
+                    self.cursor += 1;
+                }
+            }
         }
-
-        pg_sys::RelationClose(heap_relation);
-    }
-
-    #[pg_test]
-    unsafe fn test_freeze_limit_aggressive() {
-        let vacuum_freeze_min_age = 0;
-
-        Spi::run(&format!(
-            "SET vacuum_freeze_min_age = {};",
-            vacuum_freeze_min_age
-        ))
-        .unwrap();
-        Spi::run("CREATE TABLE t (id SERIAL, data TEXT);").unwrap();
-        Spi::run("INSERT INTO t (data) VALUES ('test')").unwrap();
-
-        let heap_oid: pg_sys::Oid =
-            Spi::get_one("SELECT oid FROM pg_class WHERE relname = 't' AND relnamespace = current_schema()::regnamespace;")
-                .expect("spi should succeed")
-                .unwrap();
-        let heap_relation = pg_sys::RelationIdGetRelation(heap_oid);
-
-        assert_eq!(
-            vacuum_get_freeze_limit(heap_relation),
-            pg_sys::GetOldestNonRemovableTransactionId(heap_relation),
-        );
-
-        pg_sys::RelationClose(heap_relation);
     }
 }

@@ -16,10 +16,12 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use crate::api::Cardinality;
+use crate::api::FieldName;
+use crate::api::HashSet;
+use crate::index::fast_fields_helper::WhichFastField;
 use crate::postgres::customscan::CustomScan;
 use pgrx::{pg_sys, PgList};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::fmt::{Debug, Display, Formatter};
 
 #[derive(Debug, Default, Copy, Clone, Serialize, Deserialize)]
@@ -82,7 +84,7 @@ impl From<SortDirection> for u32 {
 #[derive(Debug)]
 pub enum OrderByStyle {
     Score(*mut pg_sys::PathKey),
-    Field(*mut pg_sys::PathKey, String),
+    Field(*mut pg_sys::PathKey, FieldName),
 }
 
 impl OrderByStyle {
@@ -99,6 +101,52 @@ impl OrderByStyle {
             assert!(!pathkey.is_null());
 
             (*self.pathkey()).pk_strategy.into()
+        }
+    }
+}
+
+///
+/// The type of ExecMethod that was chosen at planning time. We fully select an ExecMethodType at
+/// planning time in order to be able to make claims about the sortedness and estimates for our
+/// execution.
+///
+/// `which_fast_fields` lists in this enum are _all_ of the fast fields which were identified at
+/// planning time: based on the join order that the planner ends up choosing, only a subset of
+/// these might be used at execution time (in an order specified by the execution time target
+/// list), but never a superset.
+///
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub enum ExecMethodType {
+    #[default]
+    Normal,
+    TopN {
+        heaprelid: pg_sys::Oid,
+        limit: usize,
+        sort_direction: SortDirection,
+    },
+    FastFieldString {
+        field: String,
+        which_fast_fields: HashSet<WhichFastField>,
+    },
+    FastFieldNumeric {
+        which_fast_fields: HashSet<WhichFastField>,
+    },
+    FastFieldMixed {
+        which_fast_fields: HashSet<WhichFastField>,
+    },
+}
+
+impl ExecMethodType {
+    ///
+    /// Returns true if this execution method will emit results in sorted order with the given
+    /// number of workers.
+    ///
+    pub fn is_sorted(&self) -> bool {
+        match self {
+            ExecMethodType::TopN { .. } => true,
+            // See https://github.com/paradedb/paradedb/issues/2623 about enabling sorted orders for
+            // String and Mixed.
+            _ => false,
         }
     }
 }
@@ -306,6 +354,10 @@ impl<P: Into<*mut pg_sys::List> + Default> CustomPathBuilder<P> {
             nworkers.try_into().expect("nworkers should be a valid i32");
 
         self
+    }
+
+    pub fn is_parallel(&self) -> bool {
+        self.custom_path_node.path.parallel_workers > 0
     }
 
     pub fn build(mut self) -> pg_sys::CustomPath {

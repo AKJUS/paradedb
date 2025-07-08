@@ -16,983 +16,466 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 mod anyenum;
-mod document;
+mod config;
 pub mod range;
 
-use anyhow::{Context, Result};
-use derive_more::{AsRef, Display, From, Into};
-pub use document::*;
-use pgrx::{PgBuiltInOids, PgOid, PgRelation};
+use crate::api::FieldName;
+use crate::api::HashMap;
+use crate::postgres::options::BM25IndexOptions;
+use crate::postgres::utils::{resolve_base_type, ExtractedFieldAttribute};
+pub use anyenum::AnyEnum;
+use anyhow::bail;
+pub use config::*;
+use std::cell::{Ref, RefCell};
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
+
+use crate::index::utils::load_index_schema;
+use crate::postgres::rel::PgSearchRelation;
+use anyhow::Result;
+use derive_more::Into;
+use pgrx::{pg_sys, PgBuiltInOids, PgOid};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
-use tantivy::schema::{
-    DateOptions, DateTimePrecision, Field, JsonObjectOptions, NumericOptions, Schema,
-    TextFieldIndexing, TextOptions,
-};
+use tantivy::schema::{Field, FieldEntry, FieldType, OwnedValue, Schema};
 use thiserror::Error;
+use tokenizers::manager::SearchTokenizerFilters;
 use tokenizers::{SearchNormalizer, SearchTokenizer};
 
-use crate::postgres::index::get_fields;
-use crate::query::AsFieldType;
-pub use anyenum::AnyEnum;
-use tokenizers::manager::SearchTokenizerFilters;
-
-/// The id of a field, stored in the index.
-#[derive(Debug, Clone, Display, From, AsRef, PartialEq, Eq, Serialize, Deserialize, Hash)]
-#[from(forward)]
-pub struct SearchFieldName(pub String);
-
-/// The name of a field, as it appears to Postgres.
-#[derive(Debug, Copy, Clone, From, PartialEq, Eq, Serialize, Deserialize)]
-#[from(forward)]
-pub struct SearchFieldId(pub Field);
-
-/// The name of the index, as it appears to Postgres.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SearchIndexName(pub String);
 /// The type of the search field.
+/// Like Tantivy's [`FieldType`](https://docs.rs/tantivy/latest/tantivy/schema/enum.FieldType.html),
+/// but with the Postgres Oid of the column that the field is based on.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SearchFieldType {
-    Text,
-    Uuid,
-    I64,
-    F64,
-    U64,
-    Bool,
-    Json,
-    Date,
-    Range,
+    Text(pg_sys::Oid),
+    Uuid(pg_sys::Oid),
+    Inet(pg_sys::Oid),
+    I64(pg_sys::Oid),
+    F64(pg_sys::Oid),
+    U64(pg_sys::Oid),
+    Bool(pg_sys::Oid),
+    Json(pg_sys::Oid),
+    Date(pg_sys::Oid),
+    Range(pg_sys::Oid),
 }
 
 impl SearchFieldType {
-    #[allow(clippy::match_like_matches_macro)] // this is easier to read as a match statement, clippy is drunk on this one
-    pub fn is_compatible_with(&self, config: &SearchFieldConfig) -> bool {
-        match (self, config) {
-            (SearchFieldType::Text, SearchFieldConfig::Text { .. }) => true,
-            (SearchFieldType::Uuid, SearchFieldConfig::Text { .. }) => true,
-            (SearchFieldType::I64, SearchFieldConfig::Numeric { .. }) => true,
-            (SearchFieldType::F64, SearchFieldConfig::Numeric { .. }) => true,
-            (SearchFieldType::U64, SearchFieldConfig::Numeric { .. }) => true,
-            (SearchFieldType::Bool, SearchFieldConfig::Boolean { .. }) => true,
-            (SearchFieldType::Json, SearchFieldConfig::Json { .. }) => true,
-            (SearchFieldType::Date, SearchFieldConfig::Date { .. }) => true,
-            (SearchFieldType::Range, SearchFieldConfig::Range { .. }) => true,
-            _ => false,
+    pub fn default_config(&self) -> SearchFieldConfig {
+        match self {
+            SearchFieldType::Text(_) => SearchFieldConfig::default_text(),
+            SearchFieldType::Uuid(_) => SearchFieldConfig::default_uuid(),
+            SearchFieldType::Inet(_) => SearchFieldConfig::default_inet(),
+            SearchFieldType::I64(_) => SearchFieldConfig::default_numeric(),
+            SearchFieldType::F64(_) => SearchFieldConfig::default_numeric(),
+            SearchFieldType::U64(_) => SearchFieldConfig::default_numeric(),
+            SearchFieldType::Bool(_) => SearchFieldConfig::default_boolean(),
+            SearchFieldType::Json(_) => SearchFieldConfig::default_json(),
+            SearchFieldType::Date(_) => SearchFieldConfig::default_date(),
+            SearchFieldType::Range(_) => SearchFieldConfig::default_range(),
         }
     }
 
-    pub fn default_config(&self) -> SearchFieldConfig {
+    pub fn typeoid(&self) -> PgOid {
         match self {
-            SearchFieldType::Text => SearchFieldConfig::default_text(),
-            SearchFieldType::Uuid => SearchFieldConfig::default_uuid(),
-            SearchFieldType::I64 => SearchFieldConfig::default_numeric(),
-            SearchFieldType::F64 => SearchFieldConfig::default_numeric(),
-            SearchFieldType::U64 => SearchFieldConfig::default_numeric(),
-            SearchFieldType::Bool => SearchFieldConfig::default_boolean(),
-            SearchFieldType::Json => SearchFieldConfig::default_json(),
-            SearchFieldType::Date => SearchFieldConfig::default_date(),
-            SearchFieldType::Range => SearchFieldConfig::default_range(),
+            SearchFieldType::Text(oid) => *oid,
+            SearchFieldType::Uuid(oid) => *oid,
+            SearchFieldType::Inet(oid) => *oid,
+            SearchFieldType::I64(oid) => *oid,
+            SearchFieldType::F64(oid) => *oid,
+            SearchFieldType::U64(oid) => *oid,
+            SearchFieldType::Bool(oid) => *oid,
+            SearchFieldType::Json(oid) => *oid,
+            SearchFieldType::Date(oid) => *oid,
+            SearchFieldType::Range(oid) => *oid,
         }
+        .into()
     }
 }
 
-impl TryFrom<&PgOid> for SearchFieldType {
+impl TryFrom<PgOid> for SearchFieldType {
     type Error = SearchIndexSchemaError;
-    fn try_from(pg_oid: &PgOid) -> Result<Self, Self::Error> {
-        match &pg_oid {
+    fn try_from(pg_oid: PgOid) -> Result<Self, Self::Error> {
+        if matches!(
+            pg_oid,
+            PgOid::BuiltIn(pg_sys::BuiltinOid::JSONBARRAYOID | pg_sys::BuiltinOid::JSONARRAYOID)
+        ) {
+            return Err(SearchIndexSchemaError::JsonArraysNotYetSupported);
+        }
+
+        let (base_oid, _) = resolve_base_type(pg_oid)
+            .unwrap_or_else(|| pgrx::error!("Failed to resolve base type for type {:?}", pg_oid));
+        match &base_oid {
             PgOid::BuiltIn(builtin) => match builtin {
-                PgBuiltInOids::TEXTOID | PgBuiltInOids::VARCHAROID => Ok(SearchFieldType::Text),
-                PgBuiltInOids::UUIDOID => Ok(SearchFieldType::Uuid),
+                PgBuiltInOids::TEXTOID | PgBuiltInOids::VARCHAROID => {
+                    Ok(SearchFieldType::Text((*builtin).into()))
+                }
+                PgBuiltInOids::UUIDOID => Ok(SearchFieldType::Uuid((*builtin).into())),
+                PgBuiltInOids::INETOID => Ok(SearchFieldType::Inet((*builtin).into())),
                 PgBuiltInOids::INT2OID | PgBuiltInOids::INT4OID | PgBuiltInOids::INT8OID => {
-                    Ok(SearchFieldType::I64)
+                    Ok(SearchFieldType::I64((*builtin).into()))
                 }
-                PgBuiltInOids::OIDOID | PgBuiltInOids::XIDOID => Ok(SearchFieldType::U64),
+                PgBuiltInOids::OIDOID | PgBuiltInOids::XIDOID => {
+                    Ok(SearchFieldType::U64((*builtin).into()))
+                }
                 PgBuiltInOids::FLOAT4OID | PgBuiltInOids::FLOAT8OID | PgBuiltInOids::NUMERICOID => {
-                    Ok(SearchFieldType::F64)
+                    Ok(SearchFieldType::F64((*builtin).into()))
                 }
-                PgBuiltInOids::BOOLOID => Ok(SearchFieldType::Bool),
-                PgBuiltInOids::JSONOID | PgBuiltInOids::JSONBOID => Ok(SearchFieldType::Json),
+                PgBuiltInOids::BOOLOID => Ok(SearchFieldType::Bool((*builtin).into())),
+                PgBuiltInOids::JSONOID | PgBuiltInOids::JSONBOID => {
+                    Ok(SearchFieldType::Json((*builtin).into()))
+                }
                 PgBuiltInOids::INT4RANGEOID
                 | PgBuiltInOids::INT8RANGEOID
                 | PgBuiltInOids::NUMRANGEOID
                 | PgBuiltInOids::DATERANGEOID
                 | PgBuiltInOids::TSRANGEOID
-                | PgBuiltInOids::TSTZRANGEOID => Ok(SearchFieldType::Range),
+                | PgBuiltInOids::TSTZRANGEOID => Ok(SearchFieldType::Range((*builtin).into())),
                 PgBuiltInOids::DATEOID
                 | PgBuiltInOids::TIMESTAMPOID
                 | PgBuiltInOids::TIMESTAMPTZOID
                 | PgBuiltInOids::TIMEOID
-                | PgBuiltInOids::TIMETZOID => Ok(SearchFieldType::Date),
-                _ => Err(SearchIndexSchemaError::InvalidPgOid(*pg_oid)),
+                | PgBuiltInOids::TIMETZOID => Ok(SearchFieldType::Date((*builtin).into())),
+                _ => Err(SearchIndexSchemaError::InvalidPgOid(pg_oid)),
             },
             PgOid::Custom(custom) => {
                 if unsafe { pgrx::pg_sys::type_is_enum(*custom) } {
-                    Ok(SearchFieldType::F64)
+                    Ok(SearchFieldType::F64(*custom))
                 } else {
-                    Err(SearchIndexSchemaError::InvalidPgOid(*pg_oid))
+                    Err(SearchIndexSchemaError::InvalidPgOid(pg_oid))
                 }
             }
-            _ => Err(SearchIndexSchemaError::InvalidPgOid(*pg_oid)),
+            _ => Err(SearchIndexSchemaError::InvalidPgOid(pg_oid)),
         }
     }
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
-pub enum SearchFieldConfig {
-    Text {
-        #[serde(default = "default_as_true")]
-        indexed: bool,
-        #[serde(default)]
-        fast: bool,
-        #[serde(default = "default_as_true")]
-        fieldnorms: bool,
-        #[serde(default)]
-        tokenizer: SearchTokenizer,
-        #[serde(default = "default_as_freqs_and_positions")]
-        record: IndexRecordOption,
-        #[serde(default)]
-        normalizer: SearchNormalizer,
-        #[serde(default)]
-        column: Option<String>,
-    },
-    Json {
-        #[serde(default = "default_as_true")]
-        indexed: bool,
-        #[serde(default)]
-        fast: bool,
-        #[serde(default = "default_as_true")]
-        fieldnorms: bool,
-        #[serde(default = "default_as_true")]
-        expand_dots: bool,
-        #[serde(default)]
-        tokenizer: SearchTokenizer,
-        #[serde(default = "default_as_freqs_and_positions")]
-        record: IndexRecordOption,
-        #[serde(default)]
-        normalizer: SearchNormalizer,
-        #[serde(default)]
-        column: Option<String>,
-    },
-    Range {
-        #[serde(default)]
-        column: Option<String>,
-    },
-    Numeric {
-        #[serde(default = "default_as_true")]
-        indexed: bool,
-        #[serde(default = "default_as_true")]
-        fast: bool,
-        #[serde(default)]
-        column: Option<String>,
-    },
-    Boolean {
-        #[serde(default = "default_as_true")]
-        indexed: bool,
-        #[serde(default = "default_as_true")]
-        fast: bool,
-        #[serde(default)]
-        column: Option<String>,
-    },
-    Date {
-        #[serde(default = "default_as_true")]
-        indexed: bool,
-        #[serde(default = "default_as_true")]
-        fast: bool,
-        #[serde(default)]
-        column: Option<String>,
-    },
+#[derive(Debug, Clone)]
+pub struct CategorizedFieldData {
+    pub attno: usize,
+    pub base_oid: PgOid,
+    pub is_array: bool,
+    pub is_json: bool,
 }
 
-impl SearchFieldConfig {
-    pub fn text_from_json(value: serde_json::Value) -> Result<Self> {
-        let obj = value
-            .as_object()
-            .context("Expected a JSON object for Text configuration")?;
-
-        let indexed = match obj.get("indexed") {
-            Some(v) => v
-                .as_bool()
-                .ok_or_else(|| anyhow::anyhow!("'indexed' field should be a boolean")),
-            None => Ok(true),
-        }?;
-
-        let fast = match obj.get("fast") {
-            Some(v) => v
-                .as_bool()
-                .ok_or_else(|| anyhow::anyhow!("'fast' field should be a boolean")),
-            None => Ok(false),
-        }?;
-
-        let fieldnorms = match obj.get("fieldnorms") {
-            Some(v) => v
-                .as_bool()
-                .ok_or_else(|| anyhow::anyhow!("'fieldnorms' field should be a boolean")),
-            None => Ok(true),
-        }?;
-
-        let tokenizer = match obj.get("tokenizer") {
-            Some(v) => SearchTokenizer::from_json_value(v),
-            None => Ok(SearchTokenizer::default()),
-        }?;
-
-        let record = match obj.get("record") {
-            Some(v) => serde_json::from_value(v.clone()),
-            None => Ok(default_as_freqs_and_positions()),
-        }?;
-
-        let normalizer = match obj.get("normalizer") {
-            Some(v) => serde_json::from_value(v.clone()),
-            None => Ok(SearchNormalizer::Raw),
-        }?;
-
-        let column = match obj.get("column") {
-            Some(v) => v
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("'column' field should be a string"))
-                .map(|s| Some(s.to_string())),
-            None => Ok(None),
-        }?;
-
-        Ok(SearchFieldConfig::Text {
-            indexed,
-            fast,
-            fieldnorms,
-            tokenizer,
-            record,
-            normalizer,
-            column,
-        })
-    }
-
-    pub fn json_from_json(value: serde_json::Value) -> Result<Self> {
-        let obj = value
-            .as_object()
-            .context("Expected a JSON object for Json configuration")?;
-
-        let indexed = match obj.get("indexed") {
-            Some(v) => v
-                .as_bool()
-                .ok_or_else(|| anyhow::anyhow!("'indexed' field should be a boolean")),
-            None => Ok(true),
-        }?;
-
-        let fast = match obj.get("fast") {
-            Some(v) => v
-                .as_bool()
-                .ok_or_else(|| anyhow::anyhow!("'fast' field should be a boolean")),
-            None => Ok(false),
-        }?;
-
-        let expand_dots = match obj.get("expand_dots") {
-            Some(v) => v
-                .as_bool()
-                .ok_or_else(|| anyhow::anyhow!("'expand_dots' field should be a boolean")),
-            None => Ok(true),
-        }?;
-
-        let tokenizer = match obj.get("tokenizer") {
-            Some(v) => SearchTokenizer::from_json_value(v),
-            None => Ok(SearchTokenizer::default()),
-        }?;
-
-        let record = match obj.get("record") {
-            Some(v) => serde_json::from_value(v.clone()),
-            None => Ok(default_as_freqs_and_positions()),
-        }?;
-
-        let normalizer = match obj.get("normalizer") {
-            Some(v) => serde_json::from_value(v.clone()),
-            None => Ok(SearchNormalizer::Raw),
-        }?;
-
-        let fieldnorms = match obj.get("fieldnorms") {
-            Some(v) => v
-                .as_bool()
-                .ok_or_else(|| anyhow::anyhow!("'fieldnorms' field should be a boolean")),
-            None => Ok(true),
-        }?;
-
-        let column = match obj.get("column") {
-            Some(v) => v
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("'column' field should be a string"))
-                .map(|s| Some(s.to_string())),
-            None => Ok(None),
-        }?;
-
-        Ok(SearchFieldConfig::Json {
-            indexed,
-            fast,
-            fieldnorms,
-            expand_dots,
-            tokenizer,
-            record,
-            normalizer,
-            column,
-        })
-    }
-
-    pub fn range_from_json(value: serde_json::Value) -> Result<Self> {
-        let obj = value
-            .as_object()
-            .context("Expected a JSON object for Json configuration")?;
-
-        let column = match obj.get("column") {
-            Some(v) => v
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("'column' field should be a string"))
-                .map(|s| Some(s.to_string())),
-            None => Ok(None),
-        }?;
-
-        Ok(SearchFieldConfig::Range { column })
-    }
-
-    pub fn numeric_from_json(value: serde_json::Value) -> Result<Self> {
-        let obj = value
-            .as_object()
-            .context("Expected a JSON object for Numeric configuration")?;
-
-        let indexed = match obj.get("indexed") {
-            Some(v) => v
-                .as_bool()
-                .ok_or_else(|| anyhow::anyhow!("'indexed' field should be a boolean")),
-            None => Ok(true),
-        }?;
-
-        let fast = match obj.get("fast") {
-            Some(v) => v
-                .as_bool()
-                .ok_or_else(|| anyhow::anyhow!("'fast' field should be a boolean")),
-            None => Ok(true),
-        }?;
-
-        let column = match obj.get("column") {
-            Some(v) => v
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("'column' field should be a string"))
-                .map(|s| Some(s.to_string())),
-            None => Ok(None),
-        }?;
-
-        Ok(SearchFieldConfig::Numeric {
-            indexed,
-            fast,
-            column,
-        })
-    }
-
-    pub fn boolean_from_json(value: serde_json::Value) -> Result<Self> {
-        let obj = value
-            .as_object()
-            .context("Expected a JSON object for Boolean configuration")?;
-
-        let indexed = match obj.get("indexed") {
-            Some(v) => v
-                .as_bool()
-                .ok_or_else(|| anyhow::anyhow!("'indexed' field should be a boolean")),
-            None => Ok(true),
-        }?;
-
-        let fast = match obj.get("fast") {
-            Some(v) => v
-                .as_bool()
-                .ok_or_else(|| anyhow::anyhow!("'fast' field should be a boolean")),
-            None => Ok(true),
-        }?;
-
-        let column = match obj.get("column") {
-            Some(v) => v
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("'column' field should be a string"))
-                .map(|s| Some(s.to_string())),
-            None => Ok(None),
-        }?;
-
-        Ok(SearchFieldConfig::Boolean {
-            indexed,
-            fast,
-            column,
-        })
-    }
-
-    pub fn date_from_json(value: serde_json::Value) -> Result<Self> {
-        let obj = value
-            .as_object()
-            .context("Expected a JSON object for Date configuration")?;
-
-        let indexed = match obj.get("indexed") {
-            Some(v) => v
-                .as_bool()
-                .ok_or_else(|| anyhow::anyhow!("'indexed' field should be a boolean")),
-            None => Ok(true),
-        }?;
-
-        let fast = match obj.get("fast") {
-            Some(v) => v
-                .as_bool()
-                .ok_or_else(|| anyhow::anyhow!("'fast' field should be a boolean")),
-            None => Ok(true),
-        }?;
-
-        let column = match obj.get("column") {
-            Some(v) => v
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("'column' field should be a string"))
-                .map(|s| Some(s.to_string())),
-            None => Ok(None),
-        }?;
-
-        Ok(SearchFieldConfig::Date {
-            indexed,
-            fast,
-            column,
-        })
-    }
-
-    pub fn column(&self) -> Option<&String> {
-        match self {
-            Self::Text { column, .. }
-            | Self::Json { column, .. }
-            | Self::Range { column, .. }
-            | Self::Numeric { column, .. }
-            | Self::Boolean { column, .. }
-            | Self::Date { column, .. } => column.as_ref(),
-        }
-    }
-}
-
-impl SearchFieldConfig {
-    pub fn from_json(value: serde_json::Value) -> Self {
-        serde_json::from_value(value)
-            .expect("value should be a valid SearchFieldConfig representation")
-    }
-
-    pub fn default_text() -> Self {
-        Self::from_json(json!({"Text": {}}))
-    }
-
-    pub fn default_uuid() -> Self {
-        SearchFieldConfig::Text {
-            indexed: true,
-            fast: true,
-            fieldnorms: false,
-
-            // NB:  This should use the `SearchTokenizer::Keyword` tokenizer but for historical
-            // reasons it uses the `SearchTokenizer::Raw` tokenizer but with the same filters
-            // configuration as the `SearchTokenizer::Keyword` tokenizer.
-            #[allow(deprecated)]
-            tokenizer: SearchTokenizer::Raw(SearchTokenizerFilters::keyword().clone()),
-            record: IndexRecordOption::Basic,
-            normalizer: SearchNormalizer::Raw,
-            column: None,
-        }
-    }
-
-    pub fn default_numeric() -> Self {
-        Self::from_json(json!({"Numeric": {}}))
-    }
-
-    pub fn default_boolean() -> Self {
-        Self::from_json(json!({"Boolean": {}}))
-    }
-
-    pub fn default_json() -> Self {
-        Self::from_json(json!({"Json": {}}))
-    }
-
-    pub fn default_date() -> Self {
-        Self::from_json(json!({"Date": {}}))
-    }
-
-    pub fn default_range() -> Self {
-        Self::from_json(json!({"Range": {}}))
-    }
-}
-
-impl From<SearchFieldConfig> for TextOptions {
-    fn from(config: SearchFieldConfig) -> Self {
-        let mut text_options = TextOptions::default();
-        match config {
-            SearchFieldConfig::Text {
-                indexed,
-                fast,
-                fieldnorms,
-                tokenizer,
-                record,
-                normalizer,
-                ..
-            } => {
-                if fast {
-                    text_options = text_options.set_fast(Some(normalizer.name()));
-                }
-                if indexed {
-                    let text_field_indexing = TextFieldIndexing::default()
-                        .set_index_option(record.into())
-                        .set_fieldnorms(fieldnorms)
-                        .set_tokenizer(&tokenizer.name());
-
-                    text_options = text_options.set_indexing_options(text_field_indexing);
-                }
-            }
-            _ => panic!("attempted to convert non-text search field config to tantivy text config"),
-        }
-        text_options
-    }
-}
-
-impl From<SearchFieldConfig> for NumericOptions {
-    fn from(config: SearchFieldConfig) -> Self {
-        let mut numeric_options = NumericOptions::default();
-        match config {
-            SearchFieldConfig::Numeric {
-                indexed,
-                fast,
-                ..
-            }
-            // Following the example of Quickwit, which uses NumericOptions for boolean options.
-            | SearchFieldConfig::Boolean { indexed, fast, .. } => {
-                if fast {
-                    numeric_options = numeric_options.set_fast();
-                }
-                if indexed {
-                    numeric_options = numeric_options.set_indexed();
-                }
-            }
-            _ => {
-                panic!(
-                    "attempted to convert non-numeric search field config to tantivy numeric config"
-                )
-            }
-        }
-        numeric_options
-    }
-}
-
-impl From<SearchFieldConfig> for JsonObjectOptions {
-    fn from(config: SearchFieldConfig) -> Self {
-        let mut json_options = JsonObjectOptions::default();
-        match config {
-            SearchFieldConfig::Json {
-                indexed,
-                fast,
-                fieldnorms,
-                expand_dots,
-                tokenizer,
-                record,
-                normalizer,
-                ..
-            } => {
-                if fast {
-                    json_options = json_options.set_fast(Some(normalizer.name()));
-                }
-                if expand_dots {
-                    json_options = json_options.set_expand_dots_enabled();
-                }
-                if indexed {
-                    let text_field_indexing = TextFieldIndexing::default()
-                        .set_index_option(record.into())
-                        .set_fieldnorms(fieldnorms)
-                        .set_tokenizer(&tokenizer.name());
-
-                    json_options = json_options.set_indexing_options(text_field_indexing);
-                }
-            }
-            SearchFieldConfig::Range { .. } => {
-                // Range must be indexed and fast to be searchable
-                let text_field_indexing = TextFieldIndexing::default();
-                json_options = json_options.set_indexing_options(text_field_indexing);
-                json_options = json_options.set_fast(Some("raw"));
-            }
-            _ => {
-                panic!("attempted to convert non-json search field config to tantivy json config")
-            }
-        }
-
-        json_options
-    }
-}
-
-impl From<SearchFieldConfig> for DateOptions {
-    fn from(config: SearchFieldConfig) -> Self {
-        let mut date_options = DateOptions::default();
-        match config {
-            SearchFieldConfig::Date { indexed, fast, .. } => {
-                if fast {
-                    date_options = date_options
-                        .set_fast()
-                        // Match Postgres' maximum allowed precision of microseconds
-                        .set_precision(DateTimePrecision::Microseconds);
-                }
-                if indexed {
-                    date_options = date_options.set_indexed();
-                }
-            }
-            _ => {
-                panic!("attempted to convert non-date search field config to tantivy date config")
-            }
-        }
-        date_options
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
-pub struct SearchField {
-    /// The id of the field, stored in the index.
-    pub id: SearchFieldId,
-    /// The name of the field, as it appears to Postgres.
-    pub name: SearchFieldName,
-    /// Configuration for the field passed at index build time.
-    pub config: SearchFieldConfig,
-    /// Field type
-    pub type_: SearchFieldType,
-}
-
-impl SearchField {
-    pub fn is_text(&self) -> bool {
-        matches!(self.type_, SearchFieldType::Text)
-    }
-
-    pub fn is_keyword(&self) -> bool {
-        matches!(
-            self.config,
-            SearchFieldConfig::Text {
-                tokenizer: SearchTokenizer::Keyword,
-                normalizer: SearchNormalizer::Raw,
-                ..
-            }
-        )
-    }
-}
-
-impl From<&SearchField> for Field {
-    fn from(val: &SearchField) -> Self {
-        val.id.0
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Into)]
+#[derive(Clone, Into)]
 pub struct SearchIndexSchema {
-    /// The fields that are stored in the index.
-    pub fields: Vec<SearchField>,
-    /// The index of the key field in the fields vector.
-    pub key: usize,
-    /// The underlying tantivy schema
     #[into]
-    pub schema: Schema,
-    /// A lookup cache for retrieving search fields.
-    #[serde(skip_serializing)]
-    pub lookup: Option<HashMap<SearchFieldName, usize>>,
+    schema: Schema,
+    bm25_options: BM25IndexOptions,
+    categorized: Rc<RefCell<Vec<(SearchField, CategorizedFieldData)>>>,
 }
 
 impl SearchIndexSchema {
-    pub fn new(
-        fields: Vec<(SearchFieldName, SearchFieldConfig, SearchFieldType)>,
-        key_index: usize,
-    ) -> Result<Self, SearchIndexSchemaError> {
-        let mut builder = Schema::builder();
-        let mut search_fields = vec![];
-
-        for (name, config, field_type) in fields {
-            let id: SearchFieldId = match field_type {
-                SearchFieldType::Text => builder.add_text_field(name.as_ref(), config.clone()),
-                SearchFieldType::Uuid => builder.add_text_field(name.as_ref(), config.clone()),
-                SearchFieldType::I64 => builder.add_i64_field(name.as_ref(), config.clone()),
-                SearchFieldType::U64 => builder.add_u64_field(name.as_ref(), config.clone()),
-                SearchFieldType::F64 => builder.add_f64_field(name.as_ref(), config.clone()),
-                SearchFieldType::Bool => builder.add_bool_field(name.as_ref(), config.clone()),
-                SearchFieldType::Json => builder.add_json_field(name.as_ref(), config.clone()),
-                SearchFieldType::Range => builder.add_json_field(name.as_ref(), config.clone()),
-                SearchFieldType::Date => builder.add_date_field(name.as_ref(), config.clone()),
-            }
-            .into();
-
-            search_fields.push(SearchField {
-                id,
-                name,
-                config,
-                type_: field_type,
-            });
-        }
-
-        Ok(Self {
-            key: key_index,
-            schema: builder.build(),
-            lookup: Self::build_lookup(&search_fields).into(),
-            fields: search_fields,
-        })
-    }
-
-    pub fn open(schema: Schema, index_relation: &PgRelation) -> Self {
-        let (fields, key_index) = unsafe { get_fields(index_relation) };
-        let search_fields = fields
-            .iter()
-            .map(|(field_name, field_config, field_type)| {
-                let field = schema.get_field(field_name.0.as_str()).unwrap();
-                SearchField {
-                    id: SearchFieldId(field),
-                    name: field_name.clone(),
-                    config: field_config.clone(),
-                    type_: *field_type,
-                }
+    pub fn open(indexrel: &PgSearchRelation) -> tantivy::Result<Self> {
+        Ok(load_index_schema(indexrel)?
+            .map(|schema| Self {
+                schema,
+                bm25_options: indexrel.options().clone(),
+                categorized: Default::default(),
             })
-            .collect::<Vec<_>>();
+            .unwrap_or_else(|| Self {
+                schema: Schema::builder().build(),
+                bm25_options: indexrel.options().clone(),
+                categorized: Default::default(),
+            }))
+    }
 
-        Self {
-            key: key_index,
-            schema,
-            lookup: Self::build_lookup(&search_fields).into(),
-            fields: search_fields,
+    pub fn tantivy_schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    pub fn ctid_field(&self) -> Field {
+        self.schema
+            .get_field("ctid")
+            .expect("ctid field should be present in the index")
+    }
+
+    pub fn key_field_name(&self) -> FieldName {
+        self.bm25_options.key_field_name()
+    }
+
+    pub fn key_field_type(&self) -> SearchFieldType {
+        self.bm25_options.key_field_type()
+    }
+
+    pub fn get_field_type(&self, name: impl AsRef<str>) -> Option<SearchFieldType> {
+        self.bm25_options
+            .get_field_type(&FieldName::from(name.as_ref()))
+    }
+
+    pub fn search_field(&self, name: impl AsRef<str>) -> Option<SearchField> {
+        match self.schema.get_field(name.as_ref()) {
+            Ok(field) => Some(SearchField::new(field, &self.bm25_options, &self.schema)),
+            Err(_) => None,
         }
     }
 
-    fn build_lookup(search_fields: &[SearchField]) -> HashMap<SearchFieldName, usize> {
-        let mut lookup = HashMap::new();
-        search_fields
-            .iter()
-            .enumerate()
-            .for_each(|(idx, search_field)| {
-                let name = search_field.name.clone();
-                lookup.insert(name, idx);
-            });
-        lookup
-    }
-
-    pub fn key_field(&self) -> SearchField {
-        self.fields
-            .get(self.key)
-            .expect("key field should be present on search schema")
-            .clone()
-    }
-
-    pub fn is_key_field(&self, name: &str) -> bool {
-        self.key_field().name.0 == name
-    }
-
-    #[inline(always)]
-    pub fn new_document(&self) -> SearchDocument {
-        SearchDocument {
-            doc: tantivy::TantivyDocument::new(),
-        }
-    }
-
-    pub fn get_search_field(&self, name: &SearchFieldName) -> Option<&SearchField> {
-        if let Some(lookup) = &self.lookup {
-            lookup.get(name).and_then(|idx| self.fields.get(*idx))
-        } else {
-            let lookup = Self::build_lookup(&self.fields);
-            lookup.get(name).and_then(|idx| self.fields.get(*idx))
-        }
-    }
-
-    pub fn is_field_raw_sortable(&self, name: &str) -> bool {
-        self.is_field_sortable(name, SearchNormalizer::Raw)
-            .is_some()
-    }
-
-    pub fn is_field_lower_sortable(&self, name: &str) -> bool {
-        self.is_field_sortable(name, SearchNormalizer::Lowercase)
-            .is_some()
-    }
-
-    pub fn is_fast_field(&self, name: &str) -> bool {
-        self.is_field_raw_sortable(name)
-    }
-
-    pub fn is_numeric_fast_field(&self, name: &str) -> bool {
-        if let Some(search_field) = self.get_search_field(&SearchFieldName(name.to_string())) {
-            matches!(
-                search_field.config,
-                SearchFieldConfig::Numeric { fast: true, .. }
-                    | SearchFieldConfig::Boolean { fast: true, .. }
-                    | SearchFieldConfig::Date { fast: true, .. }
-            )
-        } else {
-            false
-        }
-    }
-
-    fn is_field_sortable(&self, name: &str, desired_normalizer: SearchNormalizer) -> Option<()> {
-        let search_field = self.get_search_field(&SearchFieldName(name.to_string()))?;
-
-        match search_field.config {
-            SearchFieldConfig::Text {
-                fast: true,
-                normalizer,
-                ..
-            } if normalizer == desired_normalizer => Some(()),
-            SearchFieldConfig::Numeric { fast: true, .. } => Some(()),
-            SearchFieldConfig::Boolean { fast: true, .. } => Some(()),
-            SearchFieldConfig::Date { fast: true, .. } => Some(()),
-            _ => None,
-        }
+    pub fn fields(&self) -> impl Iterator<Item = (Field, &FieldEntry)> {
+        self.schema.fields()
     }
 
     /// A lookup from a Postgres column name to search fields that have
     /// marked it as their source column with the 'column' key.
-    pub fn alias_lookup(&self) -> HashMap<String, Vec<&SearchField>> {
-        let mut lookup = HashMap::new();
-        for field in &self.fields {
-            if let Some(column) = field.config.column() {
-                lookup
-                    .entry(column.to_string())
-                    .or_insert_with(Vec::new)
-                    .push(field);
-            }
+    pub fn alias_lookup(&self) -> HashMap<String, Vec<SearchField>> {
+        let mut lookup = HashMap::default();
+        let aliased_text_configs = self.bm25_options.aliased_text_configs();
+        let aliased_json_configs = self.bm25_options.aliased_json_configs();
+
+        for (alias_name, config) in aliased_text_configs {
+            let alias = config
+                .alias()
+                .expect("aliased text config must have an alias");
+            let alias_field = self
+                .search_field(alias_name)
+                .expect("aliased text config must have a search field");
+            lookup
+                .entry(alias.to_string())
+                .or_insert_with(Vec::new)
+                .push(alias_field);
         }
+
+        for (alias_name, config) in aliased_json_configs {
+            let alias = config
+                .alias()
+                .expect("aliased json config must have an alias");
+            let alias_field = self
+                .search_field(alias_name)
+                .expect("aliased json config must have a search field");
+            lookup
+                .entry(alias.to_string())
+                .or_insert_with(Vec::new)
+                .push(alias_field);
+        }
+
         lookup
     }
-}
 
-// Index record schema
-#[allow(unused)] // used by serde
-pub enum IndexRecordOptionSchema {
-    Basic,
-    WithFreqs,
-    WithFreqsAndPositions,
-}
+    pub fn categorized_fields(&self) -> Ref<Vec<(SearchField, CategorizedFieldData)>> {
+        let is_empty = self.categorized.borrow().is_empty();
+        if is_empty {
+            let mut categorized = self.categorized.borrow_mut();
+            let mut alias_lookup = self.alias_lookup();
+            for (
+                attname,
+                ExtractedFieldAttribute {
+                    attno,
+                    pg_type,
+                    tantivy_type,
+                },
+            ) in self.bm25_options.attributes().iter()
+            {
+                // List any indexed fields that use this column as source data.
+                let mut search_fields = alias_lookup.remove(attname.as_ref()).unwrap_or_default();
 
-#[derive(Debug, Serialize, Deserialize, Clone, Ord, PartialOrd, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct IndexRecordOption(tantivy::schema::IndexRecordOption);
+                // If there's an indexed field with the same name as a this column, add it to the list.
+                if let Some(index_field) = self.search_field(attname) {
+                    search_fields.push(index_field)
+                };
 
-#[allow(non_upper_case_globals)]
-impl IndexRecordOption {
-    pub const Basic: IndexRecordOption =
-        IndexRecordOption(tantivy::schema::IndexRecordOption::Basic);
-    pub const WithFreqs: IndexRecordOption =
-        IndexRecordOption(tantivy::schema::IndexRecordOption::WithFreqs);
-    pub const WithFreqsAndPositions: IndexRecordOption =
-        IndexRecordOption(tantivy::schema::IndexRecordOption::WithFreqsAndPositions);
-}
+                for search_field in search_fields {
+                    let (base_oid, is_array) = resolve_base_type(*pg_type).unwrap_or_else(|| {
+                        pgrx::error!(
+                            "Failed to resolve base type for column {} with type {:?}",
+                            attname,
+                            tantivy_type.typeoid()
+                        )
+                    });
+                    let is_json = matches!(
+                        base_oid,
+                        PgOid::BuiltIn(pg_sys::BuiltinOid::JSONBOID | pg_sys::BuiltinOid::JSONOID)
+                    );
+                    categorized.push((
+                        search_field,
+                        CategorizedFieldData {
+                            attno: *attno,
+                            base_oid,
+                            is_array,
+                            is_json,
+                        },
+                    ));
+                }
+            }
+        }
 
-impl From<tantivy::schema::IndexRecordOption> for IndexRecordOption {
-    #[inline]
-    fn from(value: tantivy::schema::IndexRecordOption) -> Self {
-        Self(value)
+        self.categorized.borrow()
     }
 }
 
-impl From<IndexRecordOption> for tantivy::schema::IndexRecordOption {
-    fn from(value: IndexRecordOption) -> Self {
-        value.0
+#[derive(Debug, Clone)]
+pub struct SearchField {
+    field: Field,
+    field_name: FieldName,
+    field_entry: FieldEntry,
+    field_type: SearchFieldType,
+    field_config: SearchFieldConfig,
+}
+
+impl Hash for SearchField {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.field.hash(state);
     }
 }
 
-impl Display for IndexRecordOption {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match &self.0 {
-            tantivy::schema::IndexRecordOption::Basic => write!(f, "basic"),
-            tantivy::schema::IndexRecordOption::WithFreqs => write!(f, "freq"),
-            tantivy::schema::IndexRecordOption::WithFreqsAndPositions => write!(f, "position"),
+impl Eq for SearchField {}
+
+impl PartialEq for SearchField {
+    fn eq(&self, other: &Self) -> bool {
+        self.field == other.field
+    }
+}
+
+impl SearchField {
+    pub fn new(field: Field, options: &BM25IndexOptions, schema: &Schema) -> Self {
+        let field_entry = schema.get_field_entry(field).clone();
+        let field_name: FieldName = field_entry.name().into();
+        let field_config = options.field_config_or_default(&field_name);
+        let field_type = options.get_field_type(&field_name).unwrap_or_else(|| {
+            panic!("`{field_name}`'s configuration not found in index WITH options")
+        });
+
+        Self {
+            field,
+            field_name,
+            field_entry,
+            field_type,
+            field_config,
+        }
+    }
+
+    pub fn field(&self) -> Field {
+        self.field
+    }
+
+    pub fn field_name(&self) -> &FieldName {
+        &self.field_name
+    }
+
+    pub fn field_entry(&self) -> &FieldEntry {
+        &self.field_entry
+    }
+
+    pub fn field_type(&self) -> SearchFieldType {
+        self.field_type
+    }
+
+    pub fn field_config(&self) -> &SearchFieldConfig {
+        &self.field_config
+    }
+
+    pub fn is_raw_sortable(&self) -> bool {
+        self.is_sortable(SearchNormalizer::Raw)
+    }
+
+    pub fn is_lower_sortable(&self) -> bool {
+        self.is_sortable(SearchNormalizer::Lowercase)
+    }
+
+    pub fn is_fast(&self) -> bool {
+        self.field_entry.is_fast()
+    }
+
+    pub fn is_numeric_fast(&self) -> bool {
+        match self.field_entry.field_type() {
+            FieldType::I64(options) => options.is_fast(),
+            FieldType::U64(options) => options.is_fast(),
+            FieldType::F64(options) => options.is_fast(),
+            FieldType::Bool(options) => options.is_fast(),
+            FieldType::Date(options) => options.is_fast(),
+            _ => false,
+        }
+    }
+
+    fn is_sortable(&self, desired_normalizer: SearchNormalizer) -> bool {
+        match self.field_entry.field_type() {
+            FieldType::Str(options) => {
+                options.is_fast()
+                    && options.get_fast_field_tokenizer_name() == Some(desired_normalizer.name())
+            }
+            FieldType::I64(options) => options.is_fast(),
+            FieldType::U64(options) => options.is_fast(),
+            FieldType::F64(options) => options.is_fast(),
+            FieldType::Bool(options) => options.is_fast(),
+            FieldType::Date(options) => options.is_fast(),
+            // TODO: Neither JSON nor range fields are not yet sortable by us
+            FieldType::JsonObject(_) => false,
+            _ => false,
+        }
+    }
+
+    pub fn is_ctid(&self) -> bool {
+        self.field_name().is_ctid()
+    }
+
+    pub fn is_datetime(&self) -> bool {
+        self.field_entry.field_type().is_date()
+    }
+
+    pub fn is_text(&self) -> bool {
+        self.field_entry.field_type().is_str()
+    }
+
+    pub fn is_json(&self) -> bool {
+        matches!(self.field_type, SearchFieldType::Json(_))
+    }
+
+    #[allow(deprecated)]
+    pub fn is_keyword(&self) -> bool {
+        self.field_config
+            .tokenizer()
+            .map(|tokenizer| {
+                (*tokenizer == SearchTokenizer::Keyword)
+                    || (*tokenizer
+                        == SearchTokenizer::Raw(SearchTokenizerFilters::keyword().clone()))
+            })
+            .unwrap_or(false)
+    }
+
+    #[allow(deprecated)]
+    pub fn uses_raw_tokenizer(&self) -> bool {
+        self.field_config
+            .tokenizer()
+            .map(|tokenizer| matches!(tokenizer, SearchTokenizer::Raw(_)))
+            .unwrap_or(false)
+    }
+
+    pub fn try_coerce(&self, value: &mut OwnedValue) -> Result<()> {
+        match (self.field_entry().field_type(), value.clone()) {
+            (FieldType::Str(_), OwnedValue::Str(_))
+            | (FieldType::U64(_), OwnedValue::U64(_))
+            | (FieldType::I64(_), OwnedValue::I64(_))
+            | (FieldType::F64(_), OwnedValue::F64(_))
+            | (FieldType::Bool(_), OwnedValue::Bool(_))
+            | (FieldType::Date(_), OwnedValue::Date(_))
+            | (FieldType::JsonObject(_), OwnedValue::Object(_)) => Ok(()),
+            (FieldType::U64(_), OwnedValue::I64(v)) => {
+                *value = OwnedValue::U64(v.try_into()?);
+                Ok(())
+            }
+            (FieldType::I64(_), OwnedValue::U64(v)) => {
+                *value = OwnedValue::I64(v.try_into()?);
+                Ok(())
+            }
+            _ => bail!(
+                "cannot coerce value {:?} to field type {:?}",
+                value,
+                self.field_entry().field_type()
+            ),
         }
     }
 }
 
 #[derive(Debug, Error)]
 pub enum SearchIndexSchemaError {
-    #[error("invalid field type for numeric: {0:?}")]
-    InvalidNumericType(SearchFieldType),
     #[error("invalid postgres oid passed to search index schema: {0:?}")]
     InvalidPgOid(PgOid),
-    #[error("no key field specified for search index")]
-    NoKeyFieldSpecified,
-    #[error("no ctid field specified for search index")]
-    NoCtidFieldSpecified,
-}
 
-fn default_as_true() -> bool {
-    true
-}
-
-fn default_as_freqs_and_positions() -> IndexRecordOption {
-    IndexRecordOption(tantivy::schema::IndexRecordOption::WithFreqsAndPositions)
-}
-
-trait AsTypeOid {
-    fn typeoid(&self, field: &SearchField) -> PgOid;
-}
-
-impl AsTypeOid for (&PgRelation, &SearchIndexSchema) {
-    fn typeoid(&self, search_field: &SearchField) -> PgOid {
-        if search_field.name.0 == "ctid" {
-            return PgOid::BuiltIn(pgrx::pg_sys::BuiltinOid::TIDOID);
-        }
-        let indexrel = self.0;
-        for attribute in indexrel.tuple_desc().iter() {
-            let attname = attribute.name().to_string();
-            let typeoid = attribute.type_oid();
-            if search_field.name.0 == attname {
-                return typeoid;
-            }
-            // If the field was aliased, return the column
-            // it points to.
-            if search_field.config.column() == Some(&attname) {
-                return typeoid;
-            }
-        }
-        panic!(
-            "search field {} not found in index '{}' with oid: {}",
-            search_field.name.0,
-            indexrel.name(),
-            indexrel.oid().to_u32()
-        );
-    }
-}
-
-impl AsTypeOid for HashMap<String, PgOid> {
-    fn typeoid(&self, search_field: &SearchField) -> PgOid {
-        if search_field.name.0 == "ctid" {
-            return PgOid::BuiltIn(pgrx::pg_sys::BuiltinOid::TIDOID);
-        }
-        self.get(&search_field.name.0)
-            .copied()
-            .unwrap_or_else(|| panic!("search field {} not found in index", search_field.name.0))
-    }
-}
-
-impl AsFieldType<String> for (&PgRelation, &SearchIndexSchema) {
-    fn key_field(&self) -> (tantivy::schema::FieldType, PgOid, Field) {
-        let search_field = self.1.key_field();
-        let field = search_field.id.0;
-        let field_type = self.1.schema.get_field_entry(field).field_type().clone();
-        (field_type, self.typeoid(&search_field), field)
-    }
-
-    fn fields(&self) -> Vec<(tantivy::schema::FieldType, PgOid, Field)> {
-        let indexrel = self.0;
-        let typeoid_lookup: HashMap<String, PgOid> = indexrel
-            .tuple_desc()
-            .iter()
-            .map(|attribute| (attribute.name().to_string(), attribute.type_oid()))
-            .collect();
-        self.1
-            .fields
-            .iter()
-            .map(|search_field| {
-                let field = search_field.id.0;
-                let field_type = self.1.schema.get_field_entry(field).field_type().clone();
-                (field_type, typeoid_lookup.typeoid(search_field), field)
-            })
-            .collect()
-    }
-    fn as_field_type(&self, from: &String) -> Option<(tantivy::schema::FieldType, PgOid, Field)> {
-        self.1
-            .get_search_field(&SearchFieldName(from.into()))
-            .map(|search_field| {
-                let field = search_field.id.0;
-                let field_type = self.1.schema.get_field_entry(field).field_type().clone();
-                (field_type, self.typeoid(search_field), field)
-            })
-    }
+    #[error("json(b) arrays are not yet supported")]
+    JsonArraysNotYetSupported,
 }
 
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use tantivy::schema::{JsonObjectOptions, NumericOptions, TextOptions};
+    use tantivy::schema::{IpAddrOptions, JsonObjectOptions, NumericOptions, TextOptions};
 
     use crate::schema::SearchFieldConfig;
 
@@ -1002,7 +485,6 @@ mod tests {
             "indexed": true,
             "fast": false,
             "fieldnorms": true,
-            "type": "default",
             "record": "basic",
             "normalizer": "raw"
         }"#;
@@ -1022,10 +504,23 @@ mod tests {
     }
 
     #[rstest]
+    fn test_search_inet_options() {
+        let json = r#"{
+            "indexed": true,
+            "fast": true
+        }"#;
+        let config: serde_json::Value = serde_json::from_str(json).unwrap();
+        let expected: SearchFieldConfig =
+            serde_json::from_value(serde_json::json!({"Inet": config})).unwrap();
+        let inet_options: IpAddrOptions = SearchFieldConfig::default_inet().into();
+
+        assert_eq!(inet_options, expected.into());
+    }
+
+    #[rstest]
     fn test_search_numeric_options() {
         let json = r#"{
             "indexed": true,
-            "fieldnorms": false,
             "fast": true
         }"#;
         let config: serde_json::Value = serde_json::from_str(json).unwrap();
@@ -1040,7 +535,6 @@ mod tests {
     fn test_search_boolean_options() {
         let json = r#"{
             "indexed": true,
-            "fieldnorms": false,
             "fast": true
         }"#;
         let config: serde_json::Value = serde_json::from_str(json).unwrap();
@@ -1057,7 +551,6 @@ mod tests {
             "indexed": true,
             "fast": false,
             "expand_dots": true,
-            "type": "default",
             "record": "basic",
             "normalizer": "raw"
         }"#;

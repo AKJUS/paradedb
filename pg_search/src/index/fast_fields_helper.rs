@@ -15,16 +15,18 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-#![allow(dead_code)]
-
 use crate::index::reader::index::SearchIndexReader;
 use crate::postgres::types::TantivyValue;
 use crate::schema::SearchFieldType;
+use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use tantivy::columnar::StrColumn;
 use tantivy::fastfield::{Column, FastFieldReaders};
 use tantivy::schema::OwnedValue;
 use tantivy::{DocAddress, DocId};
+
+/// A fast-field index position value.
+pub type FFIndex = usize;
 
 type FastFieldReadersCache = Vec<Vec<(FastFieldReaders, String, OnceLock<FFType>)>>;
 /// A helper for tracking specific "fast field" readers from a [`SearchIndexReader`] reference
@@ -47,6 +49,11 @@ impl FFHelper {
                 let mut lookup = Vec::new();
                 for field in fields {
                     match field {
+                        WhichFastField::Named(name, _) => lookup.push((
+                            fast_fields_reader.clone(),
+                            name.to_string(),
+                            OnceLock::default(),
+                        )),
                         WhichFastField::Ctid
                         | WhichFastField::TableOid
                         | WhichFastField::Score
@@ -54,11 +61,6 @@ impl FFHelper {
                             fast_fields_reader.clone(),
                             String::from("junk"),
                             OnceLock::from(FFType::Junk),
-                        )),
-                        WhichFastField::Named(name, _) => lookup.push((
-                            fast_fields_reader.clone(),
-                            name.to_string(),
-                            OnceLock::default(),
                         )),
                     }
                 }
@@ -69,7 +71,7 @@ impl FFHelper {
     }
 
     #[track_caller]
-    pub fn value(&self, field: usize, doc_address: DocAddress) -> Option<TantivyValue> {
+    pub fn value(&self, field: FFIndex, doc_address: DocAddress) -> Option<TantivyValue> {
         let entry = &self.0[doc_address.segment_ord as usize][field];
         Some(
             entry
@@ -80,25 +82,17 @@ impl FFHelper {
     }
 
     #[track_caller]
-    pub fn i64(&self, field: usize, doc_address: DocAddress) -> Option<i64> {
+    pub fn i64(&self, field: FFIndex, doc_address: DocAddress) -> Option<i64> {
         let entry = &self.0[doc_address.segment_ord as usize][field];
         entry
             .2
             .get_or_init(|| FFType::new(&entry.0, &entry.1))
             .as_i64(doc_address.doc_id)
     }
-
-    #[track_caller]
-    pub fn string(&self, field: usize, doc_address: DocAddress, value: &mut String) -> Option<()> {
-        let entry = &self.0[doc_address.segment_ord as usize][field];
-        entry
-            .2
-            .get_or_init(|| FFType::new(&entry.0, &entry.1))
-            .string(doc_address.doc_id, value)
-    }
 }
 
 /// Helper for working with different "fast field" types as if they're all one type
+#[derive(Debug)]
 pub enum FFType {
     Junk,
     Text(StrColumn),
@@ -238,9 +232,20 @@ impl FFType {
             None
         }
     }
+
+    /// Given [`DocId`]s, what are their u64 "fast field" values?
+    ///
+    /// The given `output` slice must be the same length as the docs slice.
+    #[inline(always)]
+    pub fn as_u64s(&self, docs: &[DocId], output: &mut [Option<u64>]) {
+        let FFType::U64(ff) = self else {
+            panic!("Expected a u64 column.");
+        };
+        ff.first_vals(docs, output);
+    }
 }
 
-#[derive(Debug, Clone, Ord, Eq, PartialOrd, PartialEq)]
+#[derive(Debug, Clone, Ord, Eq, PartialOrd, PartialEq, Serialize, Deserialize, Hash)]
 pub enum WhichFastField {
     Junk(String),
     Ctid,
@@ -249,7 +254,7 @@ pub enum WhichFastField {
     Named(String, FastFieldType),
 }
 
-#[derive(Debug, Clone, Ord, Eq, PartialOrd, PartialEq)]
+#[derive(Debug, Clone, Ord, Eq, PartialOrd, PartialEq, Serialize, Deserialize, Hash)]
 pub enum FastFieldType {
     String,
     Numeric,
@@ -258,7 +263,7 @@ pub enum FastFieldType {
 impl From<SearchFieldType> for FastFieldType {
     fn from(value: SearchFieldType) -> Self {
         match value {
-            SearchFieldType::Text => FastFieldType::String,
+            SearchFieldType::Text(_) => FastFieldType::String,
             _ => FastFieldType::Numeric,
         }
     }

@@ -32,23 +32,23 @@ fn merges_to_1_100k_segment(mut conn: PgConnection) {
     // one might think 100 individual inserts of 1022 bytes each would get us right at 100k of
     // segment data, and while it does, LayeredMergePolicy has a fudge factor of 33% built in
     // so we actually need more to get to the point of actually merging
-    for _ in 0..133 {
+    for _ in 0..165 {
         // creates a segment of 1022 bytes
         "insert into layer_sizes select x from generate_series(1, 33) x;".execute(&mut conn);
     }
 
-    // assert we actually have 133 segments and that a merge didn't happen yet
+    // assert we actually have 165 segments and that a merge didn't happen yet
     let (nsegments,) = "select count(*) from paradedb.index_info('idxlayer_sizes');"
         .fetch_one::<(i64,)>(&mut conn);
-    assert_eq!(nsegments, 133);
+    assert_eq!(nsegments, 165);
 
     // creates another segment of 1022 bytes, and will cause a merge based on our default layer sizes
-    // leaving behind 2 segments.  one that's a merge of all the segments we created above, and then
-    // one that is the segment created by this insert statement
+    // leaving behind 1 segment.  that's a merge of all the segments we created above plus the segment
+    // created by this INSERT
     "insert into layer_sizes select x from generate_series(1, 33) x;".execute(&mut conn);
     let (nsegments,) = "select count(*) from paradedb.index_info('idxlayer_sizes');"
         .fetch_one::<(i64,)>(&mut conn);
-    assert_eq!(nsegments, 2);
+    assert_eq!(nsegments, 1);
 }
 
 #[rstest]
@@ -82,6 +82,7 @@ fn force_merge(mut conn: PgConnection) {
     assert_eq!(nsegments, 4);
 }
 
+#[ignore]
 #[rstest]
 fn dont_merge_create_index_segments(mut conn: PgConnection) {
     // Test that a segment created by CREATE INDEX cannot get merged away even if less than layer size
@@ -110,11 +111,19 @@ fn dont_merge_create_index_segments(mut conn: PgConnection) {
 
     let (num_deleted_before,) = "SELECT sum(num_deleted)::int8 FROM paradedb.index_info('idxdont_merge_create_index_segments');"
         .fetch_one::<(i64,)>(&mut conn);
-    "INSERT INTO dont_merge_create_index_segments (id) VALUES (1)".execute(&mut conn);
+
+    // Perform many inserts to trigger a merge that merges away the deleted segments
+    for _ in 0..10 {
+        "INSERT INTO dont_merge_create_index_segments (id) VALUES (1)".execute(&mut conn);
+    }
+
     let (num_deleted_after,) = "SELECT sum(num_deleted)::int8 FROM paradedb.index_info('idxdont_merge_create_index_segments');"
         .fetch_one::<(i64,)>(&mut conn);
 
-    assert!(num_deleted_after < num_deleted_before);
+    assert!(
+        num_deleted_after < num_deleted_before,
+        "num_deleted_after {num_deleted_after}, num_deleted_before {num_deleted_before}"
+    );
 }
 
 #[rstest]

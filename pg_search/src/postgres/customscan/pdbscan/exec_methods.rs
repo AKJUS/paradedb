@@ -48,9 +48,7 @@ pub trait ExecMethod {
         true
     }
 
-    fn query(&mut self, state: &mut PdbScanState) -> bool {
-        false
-    }
+    fn query(&mut self, state: &mut PdbScanState) -> bool;
 
     fn next(&mut self, state: &mut PdbScanState) -> ExecState {
         loop {
@@ -65,11 +63,19 @@ pub trait ExecMethod {
         }
     }
 
+    fn internal_next(&mut self, state: &mut PdbScanState) -> ExecState;
+
     fn increment_visible(&mut self) {
         // default of noop
     }
 
-    fn internal_next(&mut self, state: &mut PdbScanState) -> ExecState;
+    /// This is called when the scan is rescanned.
+    ///
+    /// ## Implementor's Note
+    ///
+    /// `SearchResults` are reset for you by [`PdbScanState::reset()`], which is called by the
+    /// custom scan machinery.
+    fn reset(&mut self, state: &mut PdbScanState);
 }
 
 struct UnknownScanStyle;
@@ -81,9 +87,21 @@ impl ExecMethod for UnknownScanStyle {
         )
     }
 
+    fn query(&mut self, _state: &mut PdbScanState) -> bool {
+        unimplemented!(
+            "logic error in pg_search: `UnknownScanStyle::query()` should never be called"
+        )
+    }
+
     fn internal_next(&mut self, _state: &mut PdbScanState) -> ExecState {
         unimplemented!(
             "logic error in pg_search:  `UnknownScanStyle::internal_next()` should never be called"
+        )
+    }
+
+    fn reset(&mut self, _state: &mut PdbScanState) {
+        unimplemented!(
+            "logic error in pg_search:  `UnknownScanStyle::reset()` should never be called"
         )
     }
 }

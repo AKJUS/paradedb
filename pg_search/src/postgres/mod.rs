@@ -14,12 +14,13 @@
 //
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
-#![allow(unpredictable_function_pointer_comparisons)]
 
-use crate::postgres::parallel::Spinlock;
+use crate::api::HashMap;
+use crate::postgres::build::is_bm25_index;
+use crate::postgres::spinlock::Spinlock;
 use crate::query::SearchQueryInput;
 use pgrx::*;
-use rustc_hash::FxHashMap;
+use rel::PgSearchRelation;
 use std::io::Write;
 use tantivy::index::SegmentId;
 use tantivy::SegmentReader;
@@ -27,22 +28,28 @@ use tantivy::SegmentReader;
 mod build;
 mod cost;
 mod delete;
+pub mod expression;
 pub mod insert;
 pub mod options;
+mod ps_status;
 mod range;
 mod scan;
 mod vacuum;
 mod validate;
 
+mod build_parallel;
 pub mod customscan;
 pub mod datetime;
 #[cfg(not(feature = "pg17"))]
 pub mod fake_aminsertcleanup;
 pub mod index;
 mod parallel;
+pub mod rel;
+pub mod spinlock;
 pub mod storage;
 pub mod types;
 pub mod utils;
+pub mod var;
 pub mod visibility_checker;
 
 #[repr(u16)] // b/c that's what [`pg_sys::StrategyNumber`] is
@@ -89,6 +96,7 @@ fn bm25_handler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRouti
     #[cfg(feature = "pg17")]
     {
         amroutine.aminsertcleanup = Some(insert::aminsertcleanup);
+        amroutine.amcanbuildparallel = true;
     }
     amroutine.ambulkdelete = Some(delete::ambulkdelete);
     amroutine.amvacuumcleanup = Some(vacuum::amvacuumcleanup);
@@ -109,16 +117,13 @@ fn bm25_handler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRouti
     amroutine.into_pg_boxed()
 }
 
-pub fn rel_get_bm25_index(relid: pg_sys::Oid) -> Option<(PgRelation, PgRelation)> {
-    unsafe {
-        let rel = PgRelation::with_lock(relid, pg_sys::AccessShareLock as _);
-        for index in rel.indices(pg_sys::AccessShareLock as _) {
-            if (*index.rd_indam).ambuild == Some(build::ambuild) {
-                return Some((rel, index));
-            }
-        }
-        None
-    }
+pub fn rel_get_bm25_index(
+    relid: pg_sys::Oid,
+) -> Option<(rel::PgSearchRelation, rel::PgSearchRelation)> {
+    let rel = PgSearchRelation::with_lock(relid, pg_sys::AccessShareLock as _);
+    rel.indices(pg_sys::AccessShareLock as _)
+        .find(is_bm25_index)
+        .map(|index| (rel, index))
 }
 
 // 16 bytes for segment id + 4 bytes for u32 num_deleted_docs
@@ -152,6 +157,15 @@ impl ParallelScanPayload {
             let ptr = &mut self.data_mut()[segments_start..segments_end].as_mut_ptr();
             let segments_slice: &mut [[u8; SEGMENT_INFO_SIZE]] =
                 std::slice::from_raw_parts_mut(ptr.cast(), segments.len());
+
+            // resort the segments, smallest to largest by document count
+            //
+            // when segments are claimed by workers they're claimed from back-to-front
+            // and our goal is to have the largest segments claimed first so that
+            // the processing done on them takes longer, allowing more workers to
+            // checkout their own segments
+            let mut segments = segments.iter().collect::<Vec<_>>();
+            segments.sort_unstable_by_key(|reader| reader.max_doc() - reader.num_deleted_docs());
 
             for (segment, target) in segments.iter().zip(segments_slice.iter_mut()) {
                 let mut writer = &mut target[..];
@@ -246,6 +260,10 @@ impl ParallelScanState {
         self.mutex.acquire()
     }
 
+    pub fn nsegments(&self) -> usize {
+        self.nsegments
+    }
+
     pub fn remaining_segments(&self) -> usize {
         self.remaining_segments
     }
@@ -255,8 +273,8 @@ impl ParallelScanState {
         self.remaining_segments
     }
 
-    pub fn segments(&self) -> FxHashMap<SegmentId, u32> {
-        let mut segments = FxHashMap::default();
+    pub fn segments(&self) -> HashMap<SegmentId, u32> {
+        let mut segments = HashMap::default();
         for i in 0..self.nsegments {
             segments.insert(self.segment_id(i), self.num_deleted_docs(i));
         }
@@ -273,5 +291,9 @@ impl ParallelScanState {
 
     fn query(&self) -> anyhow::Result<Option<SearchQueryInput>> {
         self.payload.query()
+    }
+
+    fn reset(&mut self) {
+        self.remaining_segments = self.nsegments;
     }
 }

@@ -2,8 +2,8 @@
 #
 # Publish pg_search (Debian)
 # Build and publish the pg_search extension as .deb to GitHub Releases. This workflow is
-# gets triggered for both pushes to `main` and `staging`, but beta releases get filtered
-# out by the `if` condition of the job.
+# triggered on creation of a GitHub Tag, but beta releases get filtered out by the
+# `if` condition of the job.
 
 name: Publish pg_search (Debian)
 
@@ -137,7 +137,9 @@ jobs:
           gh --version
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false # Disable cache on publish workflows
 
       # Note: We need to specify bash as the shell to ensure that it doesn't default to /bin/sh on Debian, since
       # /bin/sh does not support the `[[` syntax.

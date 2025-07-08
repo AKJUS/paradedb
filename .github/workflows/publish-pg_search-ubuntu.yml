@@ -2,8 +2,8 @@
 #
 # Publish pg_search (Ubuntu)
 # Build and publish the pg_search extension as .deb to GitHub Releases. This workflow is
-# gets triggered for both pushes to `main` and `staging`, but beta releases get filtered
-# out by the `if` condition of the job.
+# triggered on creation of a GitHub Tag, but beta releases get filtered out by the
+# `if` condition of the job.
 
 name: Publish pg_search (Ubuntu)
 
@@ -35,39 +35,6 @@ jobs:
     strategy:
       matrix:
         include:
-          # Ubuntu 20.04
-          - name: Ubuntu 20.04 (Focal)
-            runner: ubicloud-standard-8-ubuntu-2004
-            pg_version: 14
-            arch: amd64
-          - name: Ubuntu 20.04 (Focal)
-            runner: ubicloud-standard-4-arm-ubuntu-2004
-            pg_version: 14
-            arch: arm64
-          - name: Ubuntu 20.04 (Focal)
-            runner: ubicloud-standard-8-ubuntu-2004
-            pg_version: 15
-            arch: amd64
-          - name: Ubuntu 20.04 (Focal)
-            runner: ubicloud-standard-4-arm-ubuntu-2004
-            pg_version: 15
-            arch: arm64
-          - name: Ubuntu 20.04 (Focal)
-            runner: ubicloud-standard-8-ubuntu-2004
-            pg_version: 16
-            arch: amd64
-          - name: Ubuntu 20.04 (Focal)
-            runner: ubicloud-standard-4-arm-ubuntu-2004
-            pg_version: 16
-            arch: arm64
-          - name: Ubuntu 20.04 (Focal)
-            runner: ubicloud-standard-8-ubuntu-2004
-            pg_version: 17
-            arch: amd64
-          - name: Ubuntu 20.04 (Focal)
-            runner: ubicloud-standard-4-arm-ubuntu-2004
-            pg_version: 17
-            arch: arm64
           # Ubuntu 22.04
           - name: Ubuntu 22.04 (Jammy)
             runner: ubicloud-standard-8-ubuntu-2204
@@ -151,7 +118,9 @@ jobs:
           gh --version
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false # Disable cache on publish workflows
 
       - name: Retrieve OS & GitHub Tag Versions
         id: version
