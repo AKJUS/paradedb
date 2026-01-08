@@ -45,6 +45,6 @@ tantivy.workspace = true
 tempfile = "3.17.1"
 time = { version = "0.3.37", features = ["serde"] }
 tokenizers = { path = "../tokenizers" }
-tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.44.2", features = ["rt-multi-thread", "macros"] }
 uuid = "1.14.0"
 num-traits = "0.2.19"
